@@ -56,6 +56,16 @@ enum Cmd {
         /// Sample name for the output column.
         #[arg(long, default_value = "SAMPLE")]
         sample_name: String,
+        /// Optional ONNX small-model checkpoint. When set, biallelic SNV
+        /// candidates are first run through the small model; only those
+        /// failing the GQ threshold fall through to the big-model image
+        /// pipeline.
+        #[arg(long)]
+        small_model: Option<PathBuf>,
+        /// CVO output for small-model accepts. Required when
+        /// `--small-model` is set.
+        #[arg(long)]
+        small_model_cvo: Option<PathBuf>,
     },
     /// Stitch CallVariantsOutput shards into a VCF (and optional gVCF).
     PostprocessVariants {
@@ -108,7 +118,17 @@ fn main() -> Result<()> {
             region,
             examples,
             sample_name,
-        } => make_examples_cmd(&reads, &ref_fasta, &region, &examples, &sample_name),
+            small_model,
+            small_model_cvo,
+        } => make_examples_cmd(
+            &reads,
+            &ref_fasta,
+            &region,
+            &examples,
+            &sample_name,
+            small_model.as_deref(),
+            small_model_cvo.as_deref(),
+        ),
         Cmd::PostprocessVariants {
             cvo,
             small_model_cvo,
@@ -149,12 +169,30 @@ fn parse_contigs(specs: &[String]) -> Result<Vec<ContigInfo>> {
     Ok(out)
 }
 
+/// One read held by the make-examples flow as plain owned data, so it
+/// can be re-borrowed across multiple per-candidate iterations without
+/// re-parsing the BAM.
+struct OwnedRead {
+    ref_start: i64,
+    cigar: Vec<(char, i64)>,
+    seq: Vec<u8>,
+    bq: Vec<u8>,
+    mq: u8,
+    is_rev: bool,
+    frag: i32,
+    name: String,
+    mate: i32,
+    hp: u8,
+}
+
 fn make_examples_cmd(
     reads_path: &std::path::Path,
     ref_path: &std::path::Path,
     region_literal: &str,
     examples_path: &std::path::Path,
     sample_name: &str,
+    small_model_path: Option<&std::path::Path>,
+    small_model_cvo_path: Option<&std::path::Path>,
 ) -> Result<()> {
     use dv_core::allelecounter::{add_read, empty_counts, AlignedRead, CounterOptions};
     use dv_core::make_examples::build_example;
@@ -197,18 +235,6 @@ fn make_examples_cmd(
         }
     }
 
-    struct OwnedRead {
-        ref_start: i64,
-        cigar: Vec<(char, i64)>,
-        seq: Vec<u8>,
-        bq: Vec<u8>,
-        mq: u8,
-        is_rev: bool,
-        frag: i32,
-        name: String,
-        mate: i32,
-        hp: u8,
-    }
 
     let (_h, mut reader) = dv_io::bam::open(reads_path).context("open BAM")?;
     let mut owned: Vec<OwnedRead> = Vec::new();
@@ -405,6 +431,33 @@ fn make_examples_cmd(
         );
     }
 
+    // ---- small-model fast path setup ----
+    // Pre-compute VAF (alt fraction × 100) per position from the allele
+    // counter output. The small model's 51-element context window reads
+    // from this map.
+    let mut vaf_at_position: std::collections::HashMap<i64, i32> =
+        std::collections::HashMap::with_capacity(counts.len());
+    for c in &counts {
+        let pos = c.position.as_ref().expect("position").position;
+        let alt_count: i32 = c.read_alleles.values().map(|a| a.count).sum();
+        let total = c.ref_supporting_read_count + alt_count;
+        if total > 0 {
+            vaf_at_position.insert(pos, 100 * alt_count / total);
+        }
+    }
+    let small_model_loaded = if let Some(p) = small_model_path {
+        try_set_ort_dylib_path();
+        Some(dv_infer::ort::SmallModelOrt::load(p).context("load small model")?)
+    } else {
+        None
+    };
+    let mut small_model_writer = match (small_model_loaded.is_some(), small_model_cvo_path) {
+        (true, Some(p)) => Some(dv_io::tfrecord::open_writer(p).context("open small CVO")?),
+        (true, None) => anyhow::bail!("--small-model also requires --small-model-cvo"),
+        _ => None,
+    };
+    let mut small_model_emitted = 0usize;
+
     // Render examples.
     let opts = PileupOptions::default();
     let kinds = [
@@ -525,8 +578,56 @@ fn make_examples_cmd(
             42, // upstream default random_seed
         );
 
-        // Each alt allele gets one example with that alt's index.
+        // For each alt-allele combo, try the small-model fast path first.
+        // If it accepts, emit a CVO with MID=small_model and skip the
+        // image render for that combo. Otherwise fall through to the
+        // big-model image example.
         for (i, _) in v.alternate_bases.iter().enumerate() {
+            let alt_indices = vec![i as i32];
+
+            // Try small model on biallelic SNVs only — for indels and
+            // multiallelics our read-support classification (1-base
+            // match) isn't faithful enough to feed the model.
+            let try_small = small_model_loaded.is_some()
+                && v.alternate_bases.len() == 1
+                && dv_core::small_model::features::is_snp(v, &alt_indices);
+
+            if try_small {
+                let alt_byte = v.alternate_bases[i].as_bytes()[0];
+                let (refs, alts, total_depth) =
+                    classify_reads_at(&owned, variant_pos, &v.reference_bases, alt_byte);
+                let feat = dv_core::small_model::compute(
+                    v,
+                    &alt_indices,
+                    &refs,
+                    &alts,
+                    total_depth,
+                    &vaf_at_position,
+                );
+                let model = small_model_loaded.as_ref().unwrap();
+                let probs = model.predict(&feat, 1)?;
+                if dv_core::small_model::passes_threshold(v, &alt_indices, &probs) {
+                    let mut variant_with_call = v.clone();
+                    if variant_with_call.calls.is_empty() {
+                        variant_with_call.calls.push(Default::default());
+                    }
+                    variant_with_call.calls[0].call_set_name = sample_name.to_string();
+                    set_model_id(&mut variant_with_call, "small_model");
+                    let cvo = CallVariantsOutput {
+                        variant: Some(variant_with_call),
+                        alt_allele_indices: Some(AltAlleleIndices {
+                            indices: alt_indices.clone(),
+                        }),
+                        genotype_probabilities: probs.iter().map(|&p| p as f64).collect(),
+                        debug_info: None,
+                    };
+                    let writer = small_model_writer.as_mut().unwrap();
+                    writer.write_record(&cvo.encode_to_vec())?;
+                    small_model_emitted += 1;
+                    continue;
+                }
+            }
+
             let mut variant_with_call = v.clone();
             // Preserve the DP/AD/VAF info populated by variant_calling; just
             // set the sample name. If no call exists yet, add one.
@@ -534,14 +635,82 @@ fn make_examples_cmd(
                 variant_with_call.calls.push(Default::default());
             }
             variant_with_call.calls[0].call_set_name = sample_name.to_string();
-            let bytes = build_example(&variant_with_call, &[i as i32], &img);
+            let bytes = build_example(&variant_with_call, &alt_indices, &img);
             writer.write_record(&bytes)?;
             emitted += 1;
         }
     }
     writer.flush()?;
-    tracing::info!(examples = emitted, "wrote examples");
+    if let Some(mut w) = small_model_writer {
+        w.flush()?;
+    }
+    tracing::info!(
+        examples = emitted,
+        small_model_cvos = small_model_emitted,
+        "wrote examples"
+    );
     Ok(())
+}
+
+/// Classify reads overlapping `variant_pos` into ref-supporting,
+/// alt-supporting (where the read base equals `alt_byte`), and report
+/// the total number of reads with coverage at this position. Walks each
+/// read's CIGAR to find its base at `variant_pos`. Skips clipped/skipped
+/// regions.
+///
+/// Restricted to single-base alts — caller guarantees this is a
+/// biallelic SNV.
+fn classify_reads_at(
+    owned: &[OwnedRead],
+    variant_pos: i64,
+    ref_bases: &str,
+    alt_byte: u8,
+) -> (Vec<dv_core::small_model::ReadAttrs>, Vec<dv_core::small_model::ReadAttrs>, i32) {
+    let ref_byte = ref_bases.as_bytes()[0].to_ascii_uppercase();
+    let alt_byte = alt_byte.to_ascii_uppercase();
+    let mut refs: Vec<dv_core::small_model::ReadAttrs> = Vec::new();
+    let mut alts: Vec<dv_core::small_model::ReadAttrs> = Vec::new();
+    let mut total = 0i32;
+
+    'reads: for r in owned {
+        let mut ref_pos = r.ref_start;
+        let mut read_pos = 0usize;
+        for &(op, len) in &r.cigar {
+            let len_us = len as usize;
+            match op {
+                'M' | '=' | 'X' => {
+                    if ref_pos <= variant_pos && variant_pos < ref_pos + len {
+                        let off = (variant_pos - ref_pos) as usize;
+                        if read_pos + off < r.seq.len() {
+                            let b = r.seq[read_pos + off].to_ascii_uppercase();
+                            let bq = r.bq.get(read_pos + off).copied().unwrap_or(0);
+                            let attrs = dv_core::small_model::ReadAttrs {
+                                mapping_quality: r.mq,
+                                avg_base_quality: bq,
+                                is_reverse_strand: r.is_rev,
+                            };
+                            total += 1;
+                            if b == ref_byte {
+                                refs.push(attrs);
+                            } else if b == alt_byte {
+                                alts.push(attrs);
+                            }
+                            // else: supports some other allele; counts
+                            // toward total_depth but not ref/alt.
+                        }
+                        continue 'reads;
+                    }
+                    ref_pos += len;
+                    read_pos += len_us;
+                }
+                'I' | 'S' => read_pos += len_us,
+                'D' | 'N' => ref_pos += len,
+                _ => {}
+            }
+        }
+    }
+
+    (refs, alts, total)
 }
 
 fn open_text_writer(path: &std::path::Path) -> Result<Box<dyn std::io::Write>> {
