@@ -177,6 +177,56 @@ pub fn read_mapping_percent_ref() -> u8 {
     MAX_PIXEL_VALUE as u8
 }
 
+/// Channel 17: homopolymer_weighted. For each position, the length of the
+/// homopolymer run it belongs to. E.g. `ATCGGGAA` → `[1, 1, 1, 3, 3, 3, 2, 2]`.
+/// Cap at 30, scale to 0..254.
+pub const MAX_HOMOPOLYMER_WEIGHTED: i32 = 30;
+
+pub fn homopolymer_weights(seq: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; seq.len()];
+    if seq.is_empty() {
+        return out;
+    }
+    let mut weight = 1i32;
+    for i in 1..seq.len() {
+        if seq[i] == seq[i - 1] {
+            weight += 1;
+        } else {
+            for j in 0..weight {
+                out[i - 1 - j as usize] = weight.min(255) as u8;
+            }
+            weight = 1;
+        }
+    }
+    for j in 0..weight {
+        out[seq.len() - 1 - j as usize] = weight.min(255) as u8;
+    }
+    out
+}
+
+pub fn homopolymer_weighted_read_at(seq: &[u8], read_pos: usize) -> u8 {
+    let weights = homopolymer_weights(seq);
+    let v = weights.get(read_pos).copied().unwrap_or(0) as i32;
+    scale_color(v, MAX_HOMOPOLYMER_WEIGHTED)
+}
+pub fn homopolymer_weighted_ref_at(ref_bases: &[u8], col: usize) -> u8 {
+    homopolymer_weighted_read_at(ref_bases, col)
+}
+
+/// Channel 16: is_homopolymer. 254 if position is part of a homopolymer
+/// run of length >= 2, else 0.
+pub fn is_homopolymer_read_at(seq: &[u8], read_pos: usize) -> u8 {
+    let weights = homopolymer_weights(seq);
+    if weights.get(read_pos).copied().unwrap_or(0) >= 2 {
+        MAX_PIXEL_VALUE as u8
+    } else {
+        0
+    }
+}
+pub fn is_homopolymer_ref_at(ref_bases: &[u8], col: usize) -> u8 {
+    is_homopolymer_read_at(ref_bases, col)
+}
+
 /// Channel 14: gap_compressed_identity. Treats consecutive
 /// insertion/deletion bases as a single mismatch (= "gap-compressed").
 /// `matches / (matches + mismatches + indel_runs) * 100`, scaled.
@@ -470,5 +520,36 @@ mod tests {
         let v = gap_compressed_identity_read(vec![('M', 4), ('X', 5)]);
         assert!((100..=120).contains(&v), "got {v}");
         assert_eq!(gap_compressed_identity_ref(), 254);
+    }
+
+    #[test]
+    fn homopolymer_weights_examples() {
+        // ATCGGGAA -> 1,1,1,3,3,3,2,2
+        assert_eq!(homopolymer_weights(b"ATCGGGAA"), vec![1, 1, 1, 3, 3, 3, 2, 2]);
+        assert_eq!(homopolymer_weights(b"AAAA"), vec![4, 4, 4, 4]);
+        assert!(homopolymer_weights(b"").is_empty());
+        assert_eq!(homopolymer_weights(b"A"), vec![1]);
+        assert_eq!(homopolymer_weights(b"ATAT"), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn homopolymer_weighted_pixel() {
+        let seq = b"ATCGGGAA";
+        // run len 1 → 254 * 1/30 ≈ 8
+        assert_eq!(homopolymer_weighted_read_at(seq, 0), 8);
+        // run len 3 → 254 * 3/30 ≈ 25
+        assert_eq!(homopolymer_weighted_read_at(seq, 3), 25);
+        // run len 2 → 254 * 2/30 ≈ 16
+        assert_eq!(homopolymer_weighted_read_at(seq, 6), 16);
+        assert_eq!(homopolymer_weighted_read_at(seq, 100), 0);
+    }
+
+    #[test]
+    fn is_homopolymer_pixel() {
+        let seq = b"ATCGGGAA";
+        assert_eq!(is_homopolymer_read_at(seq, 0), 0);
+        assert_eq!(is_homopolymer_read_at(seq, 1), 0);
+        assert_eq!(is_homopolymer_read_at(seq, 3), 254);
+        assert_eq!(is_homopolymer_read_at(seq, 6), 254);
     }
 }
