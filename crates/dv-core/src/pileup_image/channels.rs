@@ -227,6 +227,191 @@ pub fn is_homopolymer_ref_at(ref_bases: &[u8], col: usize) -> u8 {
     is_homopolymer_read_at(ref_bases, col)
 }
 
+/// Channel 23 (`base_methylation`) and Channel 24 (`base_6mA`).
+///
+/// Both share the same encoder: a per-read modification probability vector
+/// `mod_probs` (raw byte values 0..=255 from the BAM `MM/ML` tags) is
+/// linearly rescaled into pixel space against `255` (matching upstream's
+/// `ScaleColorVector(.., 255)`). Ref row is always 0.
+///
+/// Caller is responsible for selecting the right vector: `5mC` for #23,
+/// `6mA` for #24.
+pub fn base_methylation_read_at(mod_probs: Option<&[u8]>, read_index: usize) -> u8 {
+    let probs = match mod_probs {
+        Some(p) if !p.is_empty() => p,
+        _ => return 0,
+    };
+    let v = probs.get(read_index).copied().unwrap_or(0) as i32;
+    // Upstream scales against max_val=255, not 254.
+    let v = v.min(255) as f32;
+    (MAX_PIXEL_VALUE * (v / 255.0)) as u8
+}
+pub fn base_methylation_ref() -> u8 {
+    0
+}
+pub fn base_6ma_read_at(mod_probs: Option<&[u8]>, read_index: usize) -> u8 {
+    base_methylation_read_at(mod_probs, read_index)
+}
+pub fn base_6ma_ref() -> u8 {
+    0
+}
+
+/// Channel 26: supplementary_alignment. Read-row = scaled
+/// `allele_supporting_read_alpha` if the read carries the SAM
+/// supplementary flag, else `allele_unsupporting_read_alpha`. Ref row =
+/// raw `allele_unsupporting_read_alpha` (yes — upstream really does drop
+/// the alpha→pixel scaling on the ref row, see
+/// supplementary_alignment_channel.cc:63).
+pub fn supplementary_alignment_read(is_supplementary: bool, opts: &PileupOptions) -> u8 {
+    let alpha = if is_supplementary {
+        opts.allele_supporting_read_alpha
+    } else {
+        opts.allele_unsupporting_read_alpha
+    };
+    alpha_to_pixel(alpha)
+}
+pub fn supplementary_alignment_ref(opts: &PileupOptions) -> u8 {
+    opts.allele_unsupporting_read_alpha as u8
+}
+
+/// Channel 27: allele_sample_probability. `sqrt(supporting / total) * 254`.
+/// Square root weights low probabilities more. Ref row = 0.
+pub fn allele_sample_probability_read(supporting: i32, total: i32) -> u8 {
+    if total <= 0 {
+        return 0;
+    }
+    let v = supporting.clamp(0, total) as f32;
+    let prob = (v / total as f32).sqrt();
+    (MAX_PIXEL_VALUE * prob) as u8
+}
+pub fn allele_sample_probability_ref() -> u8 {
+    0
+}
+
+/// Channel 25: read_supports_variant_fuzzy. The caller computes a "support
+/// code" using upstream's logic (see `read_supports_variant_fuzzy_channel.cc`):
+///   * 0 → no support → unsupporting alpha
+///   * 1 → exact alt support → supporting alpha
+///   * 2 → other-alt support → other-allele-supporting alpha
+///   * 8/9/10 → fuzzy match within 3/2/1bp → 0.70/0.80/0.90
+///
+/// This module just maps the code to a pixel; the heavy phasing-aware
+/// classification belongs in the candidate-iteration pass that has access
+/// to the `DeepVariantCall` and `HP/PS` tags.
+pub const FUZZY_SUPPORT_NONE: i32 = 0;
+pub const FUZZY_SUPPORT_EXACT: i32 = 1;
+pub const FUZZY_SUPPORT_OTHER_ALT: i32 = 2;
+pub const FUZZY_SUPPORT_3BP: i32 = 8;
+pub const FUZZY_SUPPORT_2BP: i32 = 9;
+pub const FUZZY_SUPPORT_1BP: i32 = 10;
+
+const FUZZY_ALPHA_1BP: f32 = 0.90;
+const FUZZY_ALPHA_2BP: f32 = 0.80;
+const FUZZY_ALPHA_3BP: f32 = 0.70;
+
+pub fn read_supports_variant_fuzzy_read(support_code: i32, opts: &PileupOptions) -> u8 {
+    let alpha = match support_code {
+        FUZZY_SUPPORT_NONE => opts.allele_unsupporting_read_alpha,
+        FUZZY_SUPPORT_EXACT => opts.allele_supporting_read_alpha,
+        FUZZY_SUPPORT_1BP => FUZZY_ALPHA_1BP,
+        FUZZY_SUPPORT_2BP => FUZZY_ALPHA_2BP,
+        FUZZY_SUPPORT_3BP => FUZZY_ALPHA_3BP,
+        _ => opts.other_allele_supporting_read_alpha,
+    };
+    alpha_to_pixel(alpha)
+}
+pub fn read_supports_variant_fuzzy_ref(opts: &PileupOptions) -> u8 {
+    alpha_to_pixel(opts.allele_unsupporting_read_alpha)
+}
+
+/// Channels 28 / 29: homopolymer_insertion_quality / homopolymer_deletion_quality.
+///
+/// Per Ultima Genomics convention, each read base has a `tp` tag value
+/// indicating the direction (sign) and magnitude of the most likely indel
+/// error encoded by `QUAL[i]`. This encoder collapses each homopolymer run
+/// into a single Phred quality reflecting the sum of error probabilities
+/// in the requested direction (insertion = positive tp, deletion =
+/// negative tp). The resulting per-base quality is mapped to a pixel via
+/// `BaseQualityColor` (cap 93).
+///
+/// If `tp` is absent or the wrong length, all positions default to the
+/// max quality color (94 ≈ `254 * 93/93`).
+pub const MAX_Q_SCORE: i32 = 93;
+
+#[inline]
+fn base_quality_color(qual: i32) -> u8 {
+    scale_color(qual, MAX_Q_SCORE)
+}
+
+pub fn homopolymer_indel_quality(seq: &[u8], qualities: &[u8], tps: &[i8], is_deletion: bool) -> Vec<u8> {
+    let n = seq.len();
+    let default = base_quality_color(MAX_Q_SCORE);
+    let mut out = vec![default; n];
+    if n == 0 || qualities.len() != n || tps.len() != n {
+        return out;
+    }
+    let weights = homopolymer_weights(seq);
+    let mut i = 0usize;
+    while i < n {
+        let hmer_len = weights[i] as usize;
+        if hmer_len == 0 {
+            i += 1;
+            continue;
+        }
+        let end = (i + hmer_len).min(n);
+        let mut error_prob = 0f64;
+        for j in i..end {
+            let tp = tps[j];
+            if tp == 0 {
+                continue;
+            }
+            let is_del_err = tp < 0;
+            if is_del_err == is_deletion {
+                let q = qualities[j] as f64;
+                error_prob += 10f64.powf(q / -10.0);
+            }
+        }
+        let q = if error_prob == 0.0 {
+            MAX_Q_SCORE
+        } else {
+            let v = (-10.0 * error_prob.log10()) as i32;
+            v.min(MAX_Q_SCORE)
+        };
+        let pixel = base_quality_color(q);
+        for j in i..end {
+            out[j] = pixel;
+        }
+        i = end;
+    }
+    out
+}
+
+pub fn homopolymer_insertion_quality_read_at(
+    seq: &[u8],
+    qualities: &[u8],
+    tps: &[i8],
+    read_pos: usize,
+) -> u8 {
+    let v = homopolymer_indel_quality(seq, qualities, tps, false);
+    v.get(read_pos).copied().unwrap_or(0)
+}
+pub fn homopolymer_insertion_quality_ref() -> u8 {
+    0
+}
+
+pub fn homopolymer_deletion_quality_read_at(
+    seq: &[u8],
+    qualities: &[u8],
+    tps: &[i8],
+    read_pos: usize,
+) -> u8 {
+    let v = homopolymer_indel_quality(seq, qualities, tps, true);
+    v.get(read_pos).copied().unwrap_or(0)
+}
+pub fn homopolymer_deletion_quality_ref() -> u8 {
+    0
+}
+
 /// Channel 14: gap_compressed_identity. Treats consecutive
 /// insertion/deletion bases as a single mismatch (= "gap-compressed").
 /// `matches / (matches + mismatches + indel_runs) * 100`, scaled.
@@ -551,5 +736,119 @@ mod tests {
         assert_eq!(is_homopolymer_read_at(seq, 1), 0);
         assert_eq!(is_homopolymer_read_at(seq, 3), 254);
         assert_eq!(is_homopolymer_read_at(seq, 6), 254);
+    }
+
+    #[test]
+    fn base_methylation_scales_against_255() {
+        // 0 → 0, 255 → 254, 128 → ~127
+        let v = vec![0u8, 128, 255];
+        assert_eq!(base_methylation_read_at(Some(&v), 0), 0);
+        assert_eq!(base_methylation_read_at(Some(&v), 1), 127);
+        assert_eq!(base_methylation_read_at(Some(&v), 2), 254);
+        // Out of range → 0
+        assert_eq!(base_methylation_read_at(Some(&v), 99), 0);
+        // Missing tag → 0
+        assert_eq!(base_methylation_read_at(None, 0), 0);
+        assert_eq!(base_methylation_read_at(Some(&[]), 0), 0);
+        assert_eq!(base_methylation_ref(), 0);
+        // 6mA shares the encoder.
+        assert_eq!(base_6ma_read_at(Some(&v), 1), 127);
+        assert_eq!(base_6ma_ref(), 0);
+    }
+
+    #[test]
+    fn supplementary_alignment_alphas() {
+        let o = opts();
+        // is_supplementary=true → supporting alpha=1.0 → 254
+        assert_eq!(supplementary_alignment_read(true, &o), 254);
+        // false → unsupporting alpha=0.6 → 152
+        assert_eq!(supplementary_alignment_read(false, &o), 152);
+        // ref row drops alpha→pixel scaling (matches upstream quirk):
+        // raw alpha cast to u8 → 0 (since 0.6 truncates)
+        assert_eq!(supplementary_alignment_ref(&o), 0);
+    }
+
+    #[test]
+    fn allele_sample_probability_sqrt_scaling() {
+        // total=0 → 0
+        assert_eq!(allele_sample_probability_read(5, 0), 0);
+        // 0/10 → 0
+        assert_eq!(allele_sample_probability_read(0, 10), 0);
+        // 10/10 → sqrt(1)*254 = 254
+        assert_eq!(allele_sample_probability_read(10, 10), 254);
+        // 5/10 → sqrt(0.5)*254 ≈ 179
+        let v = allele_sample_probability_read(5, 10);
+        assert!((175..=185).contains(&v), "got {v}");
+        // 1/100 → sqrt(0.01)*254 = 25.4 → 25
+        let v = allele_sample_probability_read(1, 100);
+        assert!((20..=30).contains(&v), "got {v}");
+        assert_eq!(allele_sample_probability_ref(), 0);
+    }
+
+    #[test]
+    fn read_supports_variant_fuzzy_codes() {
+        let o = opts();
+        // Exact = supporting (alpha 1.0) → 254
+        assert_eq!(read_supports_variant_fuzzy_read(FUZZY_SUPPORT_EXACT, &o), 254);
+        // Other = other-alt (alpha 0.6) → 152
+        assert_eq!(read_supports_variant_fuzzy_read(FUZZY_SUPPORT_OTHER_ALT, &o), 152);
+        // 1bp = 0.90 → 228
+        let v = read_supports_variant_fuzzy_read(FUZZY_SUPPORT_1BP, &o);
+        assert!((225..=230).contains(&v), "got {v}");
+        // 2bp = 0.80 → 203
+        let v = read_supports_variant_fuzzy_read(FUZZY_SUPPORT_2BP, &o);
+        assert!((200..=205).contains(&v), "got {v}");
+        // 3bp = 0.70 → 177
+        let v = read_supports_variant_fuzzy_read(FUZZY_SUPPORT_3BP, &o);
+        assert!((175..=180).contains(&v), "got {v}");
+        // None = unsupporting (0.6) → 152
+        assert_eq!(read_supports_variant_fuzzy_read(FUZZY_SUPPORT_NONE, &o), 152);
+        // Unknown → defaults to other-alt
+        assert_eq!(read_supports_variant_fuzzy_read(99, &o), 152);
+        assert_eq!(read_supports_variant_fuzzy_ref(&o), 152);
+    }
+
+    #[test]
+    fn homopolymer_indel_quality_no_tp_falls_back_to_max_q() {
+        // No tp tag → vector returns max-Q color for every position.
+        let seq = b"AAAAA";
+        let q = vec![30u8; 5];
+        let tps = vec![];
+        let max = base_quality_color(MAX_Q_SCORE);
+        let v = homopolymer_indel_quality(seq, &q, &tps, true);
+        assert!(v.iter().all(|&x| x == max));
+    }
+
+    #[test]
+    fn homopolymer_indel_quality_runs_collapse() {
+        // AAAAA homopolymer of length 5. tp = [0, 1, 0, 0, 0] (one insertion err).
+        // Quality=30 at the marked position.  error_prob = 10^-3.
+        // hmer_directed_quality = -10*log10(10^-3) = 30. Pixel = scale_color(30, 93) = 81.
+        let seq = b"AAAAA";
+        let q = vec![30u8; 5];
+        let tps = vec![0i8, 1, 0, 0, 0];
+        let v = homopolymer_indel_quality(seq, &q, &tps, false); // is_deletion=false
+        // All five positions in the run get the same pixel value.
+        assert_eq!(v.len(), 5);
+        let expected = base_quality_color(30);
+        assert!(v.iter().all(|&x| x == expected), "got {v:?}");
+
+        // For deletion direction, none of these tps qualify (tp>0 is insertion),
+        // so error_prob=0 → max-Q pixel.
+        let v = homopolymer_indel_quality(seq, &q, &tps, true);
+        let max = base_quality_color(MAX_Q_SCORE);
+        assert!(v.iter().all(|&x| x == max));
+
+        // Per-position helpers should hit the same pixel.
+        assert_eq!(
+            homopolymer_insertion_quality_read_at(seq, &q, &tps, 2),
+            expected
+        );
+        assert_eq!(
+            homopolymer_deletion_quality_read_at(seq, &q, &tps, 2),
+            max
+        );
+        assert_eq!(homopolymer_insertion_quality_ref(), 0);
+        assert_eq!(homopolymer_deletion_quality_ref(), 0);
     }
 }
