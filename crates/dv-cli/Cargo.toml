@@ -8,6 +8,13 @@ license.workspace = true
 name = "dv"
 path = "src/main.rs"
 
+[features]
+# ORT is the priority backend (cross-compile-friendly, no libtensorflow
+# dependency). TF is opt-in for the SavedModel path or for parity tests.
+default = ["ort"]
+ort = ["dv-infer/ort"]
+tf = ["dv-infer/tf"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -18,5 +25,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dv-core = { path = "../dv-core" }
 dv-io = { path = "../dv-io" }
-dv-infer = { path = "../dv-infer", features = ["tf"] }
+dv-infer = { path = "../dv-infer", default-features = false }
+dv-proto = { path = "../dv-proto" }
+
+[dev-dependencies]
+prost.workspace = true
+dv-io = { path = "../dv-io" }
 dv-proto = { path = "../dv-proto" }

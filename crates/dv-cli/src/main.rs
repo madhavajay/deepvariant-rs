@@ -6,7 +6,7 @@ use prost::Message;
 
 use dv_core::postprocess::{self, PostprocessOptions};
 use dv_core::vcf;
-use dv_infer::{tf::TfBackend, InferenceBackend};
+use dv_infer::InferenceBackend;
 use dv_io::tfrecord;
 use dv_proto::dv::{call_variants_output::AltAlleleIndices, CallVariantsOutput};
 use dv_proto::nucleus_v1::{ContigInfo, ListValue, Value, Variant};
@@ -757,6 +757,87 @@ fn set_model_id(variant: &mut Variant, model_id: &str) {
     }
 }
 
+/// Pick an inference backend based on the model path's shape.
+///   - `*.onnx`              → ORT (priority backend, no libtensorflow needed)
+///   - directory or `*/saved_model.pb` → TF SavedModel
+///
+/// Returns a clear error if the requested backend isn't compiled in (e.g.
+/// `--no-default-features --features tf` and the user passed an `.onnx`
+/// path).
+fn load_backend(path: &std::path::Path) -> Result<Box<dyn InferenceBackend>> {
+    let is_onnx = path.extension().and_then(|e| e.to_str()) == Some("onnx");
+    let is_dir = path.is_dir();
+
+    if is_onnx {
+        #[cfg(feature = "ort")]
+        {
+            try_set_ort_dylib_path();
+            tracing::info!(?path, backend = "ort", "loading model");
+            let m = dv_infer::ort::OrtBackend::load(path).context("load ONNX model")?;
+            return Ok(Box::new(m));
+        }
+        #[cfg(not(feature = "ort"))]
+        anyhow::bail!(
+            ".onnx path given but dv-cli was built without the `ort` feature; \
+             rebuild with `--features ort` (it's the default)"
+        );
+    }
+
+    if is_dir {
+        #[cfg(feature = "tf")]
+        {
+            tracing::info!(?path, backend = "tf", "loading model");
+            let m = dv_infer::tf::TfBackend::load(path).context("load SavedModel")?;
+            return Ok(Box::new(m));
+        }
+        #[cfg(not(feature = "tf"))]
+        anyhow::bail!(
+            "SavedModel directory given but dv-cli was built without the `tf` \
+             feature; rebuild with `--features tf` or pass an `.onnx` path"
+        );
+    }
+
+    anyhow::bail!(
+        "checkpoint path {} is neither an `.onnx` file nor a SavedModel directory",
+        path.display()
+    )
+}
+
+/// If the user hasn't already set ORT_DYLIB_PATH, try to find a bundled
+/// `libonnxruntime.so` next to the workspace `models/` directory or
+/// alongside the binary.
+#[cfg(feature = "ort")]
+fn try_set_ort_dylib_path() {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut v = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                v.push(dir.join("libonnxruntime.so"));
+                if let Some(p) = dir.parent() {
+                    v.push(p.join("models/lib/libonnxruntime.so"));
+                }
+                if let Some(p) = dir.parent().and_then(|p| p.parent()) {
+                    v.push(p.join("models/lib/libonnxruntime.so"));
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            v.push(cwd.join("models/lib/libonnxruntime.so"));
+        }
+        v
+    };
+    for c in candidates {
+        if c.exists() {
+            tracing::info!(path = %c.display(), "auto-set ORT_DYLIB_PATH");
+            std::env::set_var("ORT_DYLIB_PATH", c);
+            return;
+        }
+    }
+}
+
 fn call_variants(
     examples: &std::path::Path,
     checkpoint: &std::path::Path,
@@ -766,7 +847,7 @@ fn call_variants(
     tracing::info!(?examples, ?checkpoint, ?output, batch_size, "call_variants");
     anyhow::ensure!(batch_size > 0, "batch_size must be > 0");
 
-    let model = TfBackend::load(checkpoint).context("load SavedModel")?;
+    let model = load_backend(checkpoint)?;
     let [h, w, c] = model.input_shape();
     anyhow::ensure!(
         h * w * c == PIXEL_BYTES,
