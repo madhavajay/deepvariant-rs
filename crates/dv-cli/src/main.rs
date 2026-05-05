@@ -207,6 +207,7 @@ fn make_examples_cmd(
         frag: i32,
         name: String,
         mate: i32,
+        hp: u8,
     }
 
     let (_h, mut reader) = dv_io::bam::open(reads_path).context("open BAM")?;
@@ -257,6 +258,20 @@ fn make_examples_cmd(
             .map(|n| std::str::from_utf8(n.as_ref()).unwrap_or("").to_string())
             .unwrap_or_default();
         let mate = if r.flags().is_first_segment() { 1 } else { 2 };
+        // HP aux tag: 1 → haplotype 1, 2 → haplotype 2, anything else → 0.
+        let hp_tag = {
+            use noodles::sam::alignment::record::data::field::Tag;
+            let data = r.data();
+            let raw = data
+                .get(&Tag::new(b'H', b'P'))
+                .and_then(|res| res.ok())
+                .and_then(|v| v.as_int());
+            match raw {
+                Some(1) => 1u8,
+                Some(2) => 2u8,
+                _ => 0u8,
+            }
+        };
         owned.push(OwnedRead {
             ref_start: start_0based,
             cigar: cigar_owned,
@@ -267,6 +282,7 @@ fn make_examples_cmd(
             frag,
             name,
             mate,
+            hp: hp_tag,
         });
     }
     tracing::info!(reads_loaded = owned.len(), "loaded reads");
@@ -487,7 +503,7 @@ fn make_examples_cmd(
                 is_reverse_strand: r.is_rev,
                 fragment_length: r.frag,
                 supports_variant: read_supports(r),
-                hp_tag: 0,
+                hp_tag: r.hp,
                 fragment_name: &r.name,
                 read_number: r.mate - 1,
             })
