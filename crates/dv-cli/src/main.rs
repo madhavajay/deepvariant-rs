@@ -287,8 +287,107 @@ fn make_examples_cmd(
     }
 
     // Run candidate caller.
-    let cands = candidates_from_counts(&counts, &VariantCallerOptions::default());
-    tracing::info!(candidates = cands.len(), "candidate variants");
+    let mut cands = candidates_from_counts(&counts, &VariantCallerOptions::default());
+    tracing::info!(initial_candidates = cands.len(), "candidate variants");
+
+    // Realigner-driven candidate expansion: walk window_selector hot spots,
+    // assemble a de Bruijn graph from local reads, and add any haplotype-vs-ref
+    // variants we don't already have. Recovers indel candidates that don't
+    // appear in any single read's CIGAR but emerge from local reassembly.
+    {
+        use dv_core::realigner::{
+            debruijn::{DeBruijnGraph, DeBruijnOptions, ReadInput},
+            orchestrator::variants_from_haplotype,
+            window_selector::{variant_reads_candidates, windows_from_scores, WindowSelectorOptions},
+        };
+        let scores = variant_reads_candidates(&counts, &WindowSelectorOptions::default());
+        // Threshold: any position with score >= 3 supports of evidence.
+        let raw_windows = windows_from_scores(&scores, 3);
+        // Pad each window by ~50bp on each side and merge overlapping ones.
+        let mut padded: Vec<(i64, i64)> = raw_windows
+            .iter()
+            .map(|(s, e)| (region.start + *s as i64 - 50, region.start + *e as i64 + 50))
+            .collect();
+        padded.sort_by_key(|w| w.0);
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for w in padded {
+            match merged.last_mut() {
+                Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                _ => merged.push(w),
+            }
+        }
+
+        let mut existing: std::collections::HashSet<(i64, String, Vec<String>)> =
+            std::collections::HashSet::new();
+        for v in &cands {
+            let mut alts = v.alternate_bases.clone();
+            alts.sort();
+            existing.insert((v.start, v.reference_bases.clone(), alts));
+        }
+
+        let dbg_opts = DeBruijnOptions::default();
+        let mut added = 0usize;
+        for (ws, we) in &merged {
+            let win_ref = match fa.fetch_range(&region.reference_name, *ws, *we) {
+                Some(b) if b.len() == (we - ws) as usize => b,
+                _ => continue,
+            };
+            // Find reads overlapping this window.
+            let win_reads: Vec<&OwnedRead> = owned
+                .iter()
+                .filter(|r| {
+                    let read_len_on_ref: i64 = r
+                        .cigar
+                        .iter()
+                        .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
+                        .map(|(_, l)| *l)
+                        .sum();
+                    let read_end = r.ref_start + read_len_on_ref;
+                    r.ref_start < *we && read_end > *ws
+                })
+                .collect();
+            let read_inputs: Vec<ReadInput<'_>> = win_reads
+                .iter()
+                .map(|r| ReadInput {
+                    aligned_sequence: &r.seq,
+                    aligned_quality: &r.bq,
+                    mapping_quality: r.mq,
+                })
+                .collect();
+            let graph = match DeBruijnGraph::build(&win_ref, &read_inputs, &dbg_opts) {
+                Some(g) => g,
+                None => continue,
+            };
+            for hap in graph.candidate_haplotypes() {
+                if hap.as_slice() == win_ref {
+                    continue;
+                }
+                for nv in variants_from_haplotype(&region.reference_name, *ws, &win_ref, &hap) {
+                    let mut alts = nv.alternate_bases.clone();
+                    alts.sort();
+                    let key = (nv.start, nv.reference_bases.clone(), alts);
+                    if existing.insert(key) {
+                        cands.push(nv);
+                        added += 1;
+                    }
+                }
+            }
+        }
+        // Keep candidates sorted by genomic coord for deterministic output.
+        cands.sort_by(|a, b| {
+            (a.reference_name.as_str(), a.start, a.end).cmp(&(
+                b.reference_name.as_str(),
+                b.start,
+                b.end,
+            ))
+        });
+        tracing::info!(
+            realigner_added = added,
+            total_candidates = cands.len(),
+            assembly_windows = merged.len(),
+            "realigner candidate expansion"
+        );
+    }
 
     // Render examples.
     let opts = PileupOptions::default();
