@@ -40,16 +40,28 @@ that's still outstanding, grouped by impact.
 These channels aren't in the WGS default set so they don't affect chr20
 parity, but they're needed for WES/PacBio/ONT model variants:
 
-- [ ] CH_HAPLOTYPE_TAG (#7) — real HP-tag parsing from BAM aux fields
-- [ ] CH_DIFF_CHANNELS_ALTERNATE_ALLELE_{1,2} (#9, #10) — alt-aligned
-- [ ] CH_BASE_CHANNELS_ALTERNATE_ALLELE_{1,2} (#20, #21) — alt-aligned
-- [ ] CH_BASE_METHYLATION (#23), CH_BASE_6MA (#24)
-- [ ] CH_HOMOPOLYMER_WEIGHTED (#17), CH_IS_HOMOPOLYMER (#16),
-      CH_HOMOPOLYMER_INSERTION_QUALITY (#28),
-      CH_HOMOPOLYMER_DELETION_QUALITY (#29)
-- [ ] CH_SUPPLEMENTARY_ALIGNMENT (#26)
-- [ ] CH_ALLELE_SAMPLE_PROBABILITY (#27)
-- [ ] CH_READ_SUPPORTS_VARIANT_FUZZY (#25)
+Encoder logic for the WGS-extended channels is now ported as pure
+functions in `pileup_image::channels`. Wiring them into the pileup
+builder (BAM aux-tag plumbing, alt-aligned re-rendering) is what's
+left:
+
+- [ ] CH_HAPLOTYPE_TAG (#7) — encoder done; needs real HP-tag parsing
+      from BAM aux fields (currently placeholder 0)
+- [ ] CH_DIFF_CHANNELS_ALTERNATE_ALLELE_{1,2} (#9, #10) — needs alt-aligned
+      pileup re-render (re-aligns reads to alt haplotype, stacks 2 channels)
+- [ ] CH_BASE_CHANNELS_ALTERNATE_ALLELE_{1,2} (#20, #21) — same alt-aligned
+      dependency
+- [x] CH_BASE_METHYLATION (#23), CH_BASE_6MA (#24) — encoder done; needs
+      MM/ML BAM aux-tag parsing
+- [x] CH_HOMOPOLYMER_WEIGHTED (#17), CH_IS_HOMOPOLYMER (#16) — done & wireable
+- [x] CH_HOMOPOLYMER_INSERTION_QUALITY (#28),
+      CH_HOMOPOLYMER_DELETION_QUALITY (#29) — encoder done; needs `tp`
+      Ultima-tag parsing
+- [x] CH_SUPPLEMENTARY_ALIGNMENT (#26) — encoder done; needs SAM flag wiring
+- [x] CH_ALLELE_SAMPLE_PROBABILITY (#27) — encoder done; needs allele-support
+      counts threaded from candidate to pileup row
+- [x] CH_READ_SUPPORTS_VARIANT_FUZZY (#25) — encoder done; needs HP/PS/ALT_PS
+      classifier (computes the support code from phasing info)
 
 ## P3 — broader coverage / robustness
 
