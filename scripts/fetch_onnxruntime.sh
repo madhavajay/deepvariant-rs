@@ -4,7 +4,7 @@
 # `dv` (which loads libonnxruntime via dlopen) can find it.
 #
 # Idempotent: if models/lib/libonnxruntime.so.1 (Linux) or
-# .../libonnxruntime.1.dylib (macOS) already exists, the script is a no-op.
+# .../libonnxruntime.dylib (macOS) already exists, the script is a no-op.
 #
 # Override the version with ORT_VERSION=1.22.0 ./scripts/fetch_onnxruntime.sh
 #
@@ -38,12 +38,12 @@ case "${uname_s}-${uname_m}" in
     Darwin-arm64)
         slug="onnxruntime-osx-arm64-${ORT_VERSION}"
         archive="${slug}.tgz"
-        sentinel="libonnxruntime.1.dylib"
+        sentinel="libonnxruntime.dylib"
         ;;
     Darwin-x86_64)
         slug="onnxruntime-osx-x86_64-${ORT_VERSION}"
         archive="${slug}.tgz"
-        sentinel="libonnxruntime.1.dylib"
+        sentinel="libonnxruntime.dylib"
         ;;
     *)
         echo "error: unsupported platform ${uname_s}-${uname_m}" >&2
