@@ -1,0 +1,22 @@
+[package]
+name = "dv-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["tf"]
+tf = ["dep:tensorflow"]
+ort = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tensorflow = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+[dev-dependencies]
+dv-proto = { path = "../dv-proto" }
+dv-io = { path = "../dv-io" }
+prost.workspace = true

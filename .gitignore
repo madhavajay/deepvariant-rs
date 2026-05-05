@@ -1,0 +1,16 @@
+# Cargo build artifacts
+/target
+**/target
+
+# Models — extracted from `deepvariant:release` Docker image (~192 MB).
+# Re-extract via `docker cp deepvariant:release:/opt/models/wgs models/wgs`.
+/models
+
+# Quickstart fixtures — re-downloadable from
+# https://storage.googleapis.com/deepvariant/quickstart-testdata
+/quickstart
+
+# Editor / OS noise
+.idea
+.vscode
+.DS_Store

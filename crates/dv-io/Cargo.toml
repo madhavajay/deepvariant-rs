@@ -1,0 +1,15 @@
+[package]
+name = "dv-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+noodles.workspace = true
+crc32c.workspace = true
+flate2.workspace = true
+prost.workspace = true
+dv-proto = { path = "../dv-proto" }
