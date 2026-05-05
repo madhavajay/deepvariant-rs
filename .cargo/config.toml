@@ -1,0 +1,12 @@
+# Embed an rpath that points back into the tensorflow-sys build dir so the
+# `dv` binary can find libtensorflow.so.2 / libtensorflow_framework.so.2
+# without LD_LIBRARY_PATH.
+#
+# `$ORIGIN` is resolved at load time relative to the binary location.
+# debug binary lives in target/debug/, libs in target/debug/build/tensorflow-sys-*/out/.
+# We add multiple search paths since the build hash directory name varies.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/build/tensorflow-sys-d574b857015afcff/out",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../build/tensorflow-sys-d574b857015afcff/out",
+]
