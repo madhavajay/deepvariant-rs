@@ -95,6 +95,13 @@ left:
   Verified by `tests/call_variants_backend_parity.rs`: 24 chr20 CVOs,
   max prob delta `1.7e-6`, post-processed VCFs byte-identical.
 
+- [x] **Bundled ONNX Runtime fetcher.** `scripts/fetch_onnxruntime.sh`
+  downloads the right pre-built tarball from the official Microsoft
+  release page into `models/lib/` (Linux x86_64/aarch64, macOS
+  arm64/x86_64). Idempotent. `dv-cli/build.rs` emits a one-line
+  cargo warning on a fresh clone if the lib is missing, pointing at
+  the script. No compilation needed.
+
 - [x] **Auto `.tbi` index emission** alongside `.vcf.gz` outputs via
   `noodles-tabix`. `dv postprocess-variants` now writes
   `<output>.vcf.gz.tbi` (and `.g.vcf.gz.tbi`) automatically.
