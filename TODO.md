@@ -82,8 +82,9 @@ left:
 
 ## P4 — I/O polish
 
-- [ ] **Auto `.tbi` index emission** alongside `.vcf.gz` outputs via
-  `noodles-tabix`. Currently a follow-up `tabix` invocation is needed.
+- [x] **Auto `.tbi` index emission** alongside `.vcf.gz` outputs via
+  `noodles-tabix`. `dv postprocess-variants` now writes
+  `<output>.vcf.gz.tbi` (and `.g.vcf.gz.tbi`) automatically.
 
 - [ ] **`make_examples_call_variant_outputs.tfrecord` output.** When
   the small-model fast path is implemented, also emit the small-model

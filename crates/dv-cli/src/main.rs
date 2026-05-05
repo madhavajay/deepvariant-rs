@@ -540,6 +540,29 @@ fn open_text_writer(path: &std::path::Path) -> Result<Box<dyn std::io::Write>> {
     })
 }
 
+/// Build a tabix `.tbi` index alongside `path` if it ends in `.gz`.
+/// No-op for plain `.vcf` outputs; index path is `<path>.tbi`.
+fn maybe_emit_tbi(path: &std::path::Path) -> Result<()> {
+    if path.extension().and_then(|e| e.to_str()) != Some("gz") {
+        return Ok(());
+    }
+    let index = noodles::vcf::fs::index(path)
+        .with_context(|| format!("build tabix index for {}", path.display()))?;
+    let tbi_path = {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tbi");
+        std::path::PathBuf::from(s)
+    };
+    let f = std::fs::File::create(&tbi_path)
+        .with_context(|| format!("create {}", tbi_path.display()))?;
+    let mut writer = noodles::tabix::io::Writer::new(std::io::BufWriter::new(f));
+    writer
+        .write_index(&index)
+        .with_context(|| format!("write {}", tbi_path.display()))?;
+    tracing::info!(path = %tbi_path.display(), "wrote tabix index");
+    Ok(())
+}
+
 fn postprocess_variants(
     cvo: &std::path::Path,
     small_model_cvo: Option<&std::path::Path>,
@@ -575,7 +598,9 @@ fn postprocess_variants(
         emitted_vcf += 1;
     }
     vcf_writer.flush()?;
+    drop(vcf_writer);
     tracing::info!(emitted_vcf, "wrote VCF");
+    maybe_emit_tbi(output_vcf)?;
 
     // gVCF (optional)
     if let (Some(gvcf_path), Some(nv_path)) = (output_gvcf, nonvariant_site_tfrecord) {
@@ -648,7 +673,9 @@ fn emit_gvcf(
         emitted_gvcf += 1;
     }
     g_writer.flush()?;
+    drop(g_writer);
     tracing::info!(emitted_gvcf, "wrote gVCF");
+    maybe_emit_tbi(gvcf_path)?;
     Ok(())
 }
 
