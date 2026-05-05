@@ -1,0 +1,18 @@
+[package]
+name = "dv-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Generated proto Rust files contain doc comments lifted from the upstream
+# `.proto`s, which include code-fenced examples in non-Rust syntax that
+# rustdoc tries to compile as doctests. Disable doctest extraction.
+doctest = false
+
+[dependencies]
+prost.workspace = true
+bytes.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

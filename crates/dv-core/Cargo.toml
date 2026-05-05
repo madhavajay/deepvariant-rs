@@ -1,0 +1,20 @@
+[package]
+name = "dv-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+noodles.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+dv-proto = { path = "../dv-proto" }
+dv-io = { path = "../dv-io" }
+prost.workspace = true
+noodles.workspace = true
+rand.workspace = true
+rand_mt.workspace = true

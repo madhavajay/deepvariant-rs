@@ -1,0 +1,6 @@
+[submodule "deepvariant"]
+	path = deepvariant
+	url = https://github.com/madhavajay/deepvariant.git
+[submodule "deepvariant-macos-arm64-metal"]
+	path = deepvariant-macos-arm64-metal
+	url = https://github.com/Lambda-Biolab/deepvariant-macos-arm64-metal.git

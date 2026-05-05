@@ -1,0 +1,22 @@
+[package]
+name = "dv-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+flate2.workspace = true
+noodles.workspace = true
+prost.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dv-core = { path = "../dv-core" }
+dv-io = { path = "../dv-io" }
+dv-infer = { path = "../dv-infer", features = ["tf"] }
+dv-proto = { path = "../dv-proto" }
