@@ -14,10 +14,12 @@ that's still outstanding, grouped by impact.
   `tract`/`burn` or another keras→ort path), implement the fast-path
   decision logic from `make_examples_core.py`.
 
-- [ ] **Wire realigner into `dv make-examples` candidate flow.**
-  `dv-core::realigner::orchestrator::discover_variants_from_realigner`
-  exists but isn't called by the CLI. Needed for chr20 84/84 candidate
-  parity (currently 83) and for indel-heavy regions in general.
+- [x] **Wire realigner into `dv make-examples` candidate flow.**
+  Now called inline (window selector → de Bruijn assembly →
+  `variants_from_haplotype`). Recovers indels that don't appear in any
+  single read's CIGAR. Multi-allelic indels in long repeats still
+  missing from byte-diff sweep — needs a haplotype-vs-haplotype
+  realignment pass (or larger k for the assembler).
 
 ## P1 — pileup parity edge cases (currently 100% on chr20:10001019)
 
@@ -26,9 +28,11 @@ that's still outstanding, grouped by impact.
   aligned to the alt haplotype and stacks 2 extra channels (#9, #10
   for diff; #20, #21 for base). Adds two channels to the model input.
 
-- [ ] **Run pileup byte-diff on more variants.** Current diff harness
-  only checks chr20:10001019. Sweep all 32 norealign upstream examples
-  and confirm 100% pixel match holds across SNV/INS/DEL/multi-allelic.
+- [x] **Run pileup byte-diff on more variants.** Sweep harness now runs
+  all 32 norealign upstream examples; current state is 100% on the SNV
+  floor (chr20:10001019), 99.06% overall pixel match across 25
+  compared records, with 7 multi-allelic / repeat-region indels still
+  missing from our candidate set (deeper realigner work).
 
 - [ ] **Indel-anchor edge cases.** The DELETE off-by-one + SOFT_CLIP
   fix landed on chr20 SNV. Verify it holds for reads with a leading
@@ -45,8 +49,9 @@ functions in `pileup_image::channels`. Wiring them into the pileup
 builder (BAM aux-tag plumbing, alt-aligned re-rendering) is what's
 left:
 
-- [ ] CH_HAPLOTYPE_TAG (#7) — encoder done; needs real HP-tag parsing
-      from BAM aux fields (currently placeholder 0)
+- [x] CH_HAPLOTYPE_TAG (#7) — encoder done; HP-tag now parsed from BAM
+      aux fields in `dv make-examples` and threaded through to the
+      pileup builder.
 - [ ] CH_DIFF_CHANNELS_ALTERNATE_ALLELE_{1,2} (#9, #10) — needs alt-aligned
       pileup re-render (re-aligns reads to alt haplotype, stacks 2 channels)
 - [ ] CH_BASE_CHANNELS_ALTERNATE_ALLELE_{1,2} (#20, #21) — same alt-aligned
