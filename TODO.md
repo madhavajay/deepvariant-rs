@@ -87,6 +87,14 @@ left:
 
 ## P4 — I/O polish
 
+- [x] **TF made optional, ORT is now the default backend.** `cargo build`
+  produces a `dv` that links neither libtensorflow nor libonnxruntime
+  (ORT loads via `dlopen`). TF stays available for regression testing
+  via `--features tf`. Backend selection is automatic from the
+  `--checkpoint` path (`.onnx` → ORT, directory → SavedModel/TF).
+  Verified by `tests/call_variants_backend_parity.rs`: 24 chr20 CVOs,
+  max prob delta `1.7e-6`, post-processed VCFs byte-identical.
+
 - [x] **Auto `.tbi` index emission** alongside `.vcf.gz` outputs via
   `noodles-tabix`. `dv postprocess-variants` now writes
   `<output>.vcf.gz.tbi` (and `.g.vcf.gz.tbi`) automatically.

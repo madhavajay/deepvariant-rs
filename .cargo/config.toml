@@ -1,18 +1,3 @@
-# Embed an rpath that points back into the tensorflow-sys build dir so the
-# `dv` binary can find libtensorflow.so.2 / libtensorflow_framework.so.2
-# without LD_LIBRARY_PATH. The exact hash dir name varies per cargo
-# rebuild, so we list the current debug + release hashes. If you see
-# `error while loading shared libraries: libtensorflow_framework.so.2`,
-# update the hashes here from `find target -name libtensorflow.so`.
-#
-# `$ORIGIN` is resolved at load time relative to the binary location.
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    # debug
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/build/tensorflow-sys-dcb2b767d9ef58e7/out",
-    # release
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/build/tensorflow-sys-abd0ab388aa204f2/out",
-    # also via deps/.. for tests
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../build/tensorflow-sys-dcb2b767d9ef58e7/out",
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../build/tensorflow-sys-abd0ab388aa204f2/out",
-]
+# NOTE: TF rpath embedding moved to crates/dv-cli/build.rs and is only
+# applied when the `tf` feature is enabled. Default builds use ORT via
+# load-dynamic and don't link any native ML library at all.
