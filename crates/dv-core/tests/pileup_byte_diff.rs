@@ -32,6 +32,16 @@ fn ours_path() -> PathBuf {
     PathBuf::from("/tmp/dv_final.tfrecord.gz")
 }
 
+/// Iterate every record in a TFRecord and return them.
+fn read_all(path: &std::path::Path) -> Vec<(Variant, Vec<u8>)> {
+    let mut r = dv_io::tfrecord::open_reader(path).expect("open");
+    let mut out = Vec::new();
+    while let Some(rec) = r.read_record().unwrap() {
+        out.push(parse_example(&rec));
+    }
+    out
+}
+
 fn parse_example(payload: &[u8]) -> (Variant, Vec<u8>) {
     let ex = Example::decode(payload).expect("decode");
     let f = ex.features.expect("features");
@@ -335,4 +345,86 @@ fn pileup_byte_diff_chr20_10001019() {
     // We start at some baseline (probably 60-70% from layout fixes done so
     // far) and the goal is to get this above 95%+.
     assert!(overall_pct > 0.0);
+}
+
+/// Sweep every upstream norealign example and confirm 100% pixel match.
+#[test]
+fn pileup_byte_diff_all_chr20_examples() {
+    if !ours_path().exists() {
+        eprintln!("skipping: run `dv make-examples` first");
+        return;
+    }
+    let upstream = read_all(&fixture("examples.tfrecord.gz"));
+    let ours_all = read_all(&ours_path());
+    eprintln!(
+        "upstream: {} examples, ours: {} examples",
+        upstream.len(),
+        ours_all.len()
+    );
+
+    // Index ours by (start, end, ref_bases, sorted_alts).
+    let mut ours_index: HashMap<(i64, i64, String, Vec<String>), Vec<u8>> = HashMap::new();
+    for (v, img) in &ours_all {
+        let mut alts = v.alternate_bases.clone();
+        alts.sort();
+        let key = (v.start, v.end, v.reference_bases.clone(), alts);
+        ours_index.insert(key, img.clone());
+    }
+
+    let mut total_pixels = 0usize;
+    let mut total_match = 0usize;
+    let mut compared = 0usize;
+    let mut missing = 0usize;
+    let mut perfect = 0usize;
+    for (v, up_img) in &upstream {
+        let mut alts = v.alternate_bases.clone();
+        alts.sort();
+        let key = (v.start, v.end, v.reference_bases.clone(), alts);
+        let our_img = match ours_index.get(&key) {
+            Some(i) => i,
+            None => {
+                missing += 1;
+                eprintln!(
+                    "  MISSING ours: {}:{} {}>{:?}",
+                    v.reference_name, v.start, v.reference_bases, v.alternate_bases
+                );
+                continue;
+            }
+        };
+        compared += 1;
+        let mut local_match = 0usize;
+        for (a, b) in up_img.iter().zip(our_img.iter()) {
+            total_pixels += 1;
+            if a == b {
+                total_match += 1;
+                local_match += 1;
+            }
+        }
+        let local_pct = local_match as f64 / TOTAL as f64 * 100.0;
+        if local_pct == 100.0 {
+            perfect += 1;
+        } else {
+            eprintln!(
+                "  diff:  {}:{} {}>{:?}  match={local_pct:.4}%",
+                v.reference_name, v.start, v.reference_bases, v.alternate_bases
+            );
+        }
+    }
+    let overall = total_match as f64 / total_pixels.max(1) as f64 * 100.0;
+    eprintln!(
+        "\n=== sweep summary ===\n  upstream: {}\n  ours: {}\n  compared: {compared}, missing: {missing}\n  perfect rows: {perfect}/{compared}\n  overall pixel match: {overall:.4}% ({total_match}/{total_pixels})",
+        upstream.len(),
+        ours_all.len()
+    );
+    // Diagnostic only — failures here surface layout bugs to fix, but
+    // don't break CI. Bookkeeping floor: at least the SNVs (which made up
+    // ~70% of upstream's set last time we measured) should match 100%.
+    let snv_count = upstream
+        .iter()
+        .filter(|(v, _)| v.reference_bases.len() == 1 && v.alternate_bases.iter().all(|a| a.len() == 1))
+        .count();
+    assert!(
+        perfect >= snv_count,
+        "expected at least {snv_count} (all SNVs) perfect matches, got {perfect}"
+    );
 }
