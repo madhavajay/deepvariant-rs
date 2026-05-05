@@ -23,6 +23,11 @@ fn main() -> Result<()> {
 
     let mut cfg = prost_build::Config::new();
     cfg.include_file("_includes.rs");
+    // Use BTreeMap for all map<> fields so encoded output is stable
+    // across runs and threads — required for byte-equal regression
+    // tests on tf.Example shards (otherwise the field-iteration order
+    // for Features.feature varies between processes).
+    cfg.btree_map(["."]);
     cfg.compile_protos(protos, &[proto_root])?;
     Ok(())
 }

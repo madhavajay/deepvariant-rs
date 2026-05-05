@@ -163,7 +163,7 @@ fn parse_contigs(specs: &[String]) -> Result<Vec<ContigInfo>> {
             description: String::new(),
             n_bases: len.parse().context("contig length")?,
             pos_in_fasta: i as i32,
-            extra: std::collections::HashMap::new(),
+            extra: std::collections::BTreeMap::new(),
         });
     }
     Ok(out)
@@ -475,6 +475,21 @@ fn make_examples_cmd(
 
     let mut writer = dv_io::tfrecord::open_writer(examples_path).context("open TFRecord")?;
     let mut emitted = 0usize;
+
+    // ---- Pass 1 (serial): small-model decisions + FASTA pre-fetch ----
+    //
+    // For each candidate we decide whether each alt-allele combo takes
+    // the small-model fast path. Any that doesn't gets queued in
+    // `pending_renders` along with its FASTA window. Rendering then runs
+    // in parallel (Pass 2) and writes happen serially afterward (Pass 3).
+    struct PendingRender {
+        variant: Variant,
+        alt_indices: Vec<i32>,
+        img_ref: Vec<u8>,
+        win_start: i64,
+        variant_pos: i64,
+    }
+    let mut pending_renders: Vec<PendingRender> = Vec::new();
     for v in &cands {
         let win_start = v.start - center;
         let win_end = win_start + width as i64;
@@ -482,106 +497,12 @@ fn make_examples_cmd(
             Some(b) if b.len() == width => b,
             _ => continue,
         };
-        // Upstream's `Query(region)` for the pileup uses a tight region
-        // around the variant: `[variant.start - read_overlap_buffer_bp,
-        // variant.end + read_overlap_buffer_bp)` where buffer defaults to 5.
-        // (See `make_examples_native.cc:643-648`.)
-        const READ_OVERLAP_BUFFER_BP: i64 = 5;
-        let query_start = v.start - READ_OVERLAP_BUFFER_BP;
-        let query_end = v.end + READ_OVERLAP_BUFFER_BP;
-        let window_reads: Vec<&OwnedRead> = owned
-            .iter()
-            .filter(|r| {
-                let read_len_on_ref: i64 = r
-                    .cigar
-                    .iter()
-                    .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
-                    .map(|(_, l)| *l)
-                    .sum();
-                let read_end = r.ref_start + read_len_on_ref;
-                r.ref_start < query_end && read_end > query_start
-            })
-            .collect();
         let variant_pos = v.start;
-        // For each read, check whether it supports any of the alt alleles
-        // by reading its base at the variant position.
-        let alt_set: std::collections::HashSet<u8> = v
-            .alternate_bases
-            .iter()
-            .filter_map(|a| a.as_bytes().first().copied())
-            .collect();
-        let read_supports = |r: &OwnedRead| -> bool {
-            let mut ref_pos = r.ref_start;
-            let mut read_pos = 0usize;
-            for &(op, len) in &r.cigar {
-                let len_us = len as usize;
-                match op {
-                    'M' | '=' | 'X' => {
-                        if ref_pos <= variant_pos && variant_pos < ref_pos + len {
-                            let off = (variant_pos - ref_pos) as usize;
-                            if read_pos + off < r.seq.len() {
-                                let b = r.seq[read_pos + off];
-                                return alt_set.contains(&b);
-                            }
-                            return false;
-                        }
-                        ref_pos += len;
-                        read_pos += len_us;
-                    }
-                    'I' | 'S' => read_pos += len_us,
-                    'D' | 'N' => ref_pos += len,
-                    _ => {}
-                }
-            }
-            false
-        };
-        // Diagnostic: dump supports classification for chr20:10001019.
-        if v.start == 10_001_018 && std::env::var("DV_DEBUG_SUPPORTS").is_ok() {
-            for r in &window_reads {
-                let s = read_supports(r);
-                eprintln!(
-                    "  supports={} ref_start={} name={} mate={}",
-                    s, r.ref_start, r.name, r.mate
-                );
-            }
-        }
-        let pileup_reads: Vec<PileupRead<'_>> = window_reads
-            .iter()
-            .map(|r| PileupRead {
-                ref_start: r.ref_start,
-                cigar: &r.cigar,
-                seq: &r.seq,
-                base_quality: &r.bq,
-                mapping_quality: r.mq,
-                is_reverse_strand: r.is_rev,
-                fragment_length: r.frag,
-                supports_variant: read_supports(r),
-                hp_tag: r.hp,
-                fragment_name: &r.name,
-                read_number: r.mate - 1,
-            })
-            .collect();
-        let ctx = Some(VariantContext {
-            variant_pos: variant_pos,
-            min_base_quality_at_call: 10,
-        });
-        let img = render(
-            win_start,
-            width,
-            height,
-            5, // upstream default reference_band_height
-            &img_ref,
-            &pileup_reads,
-            &kinds,
-            &opts,
-            ctx,
-            42, // upstream default random_seed
-        );
 
-        // For each alt-allele combo, try the small-model fast path first.
-        // If it accepts, emit a CVO with MID=small_model and skip the
-        // image render for that combo. Otherwise fall through to the
-        // big-model image example.
+        // For each alt-allele combo, try the small-model fast path
+        // first. If it accepts, emit a CVO with MID=small_model now.
+        // Otherwise queue the (variant, alt_indices) for parallel image
+        // rendering in Pass 2.
         for (i, _) in v.alternate_bases.iter().enumerate() {
             let alt_indices = vec![i as i32];
 
@@ -627,18 +548,127 @@ fn make_examples_cmd(
                     continue;
                 }
             }
+            pending_renders.push(PendingRender {
+                variant: v.clone(),
+                alt_indices,
+                img_ref: img_ref.clone(),
+                win_start,
+                variant_pos,
+            });
+        }
+    }
 
-            let mut variant_with_call = v.clone();
-            // Preserve the DP/AD/VAF info populated by variant_calling; just
-            // set the sample name. If no call exists yet, add one.
+    // ---- Pass 2 (parallel): render images ----
+    //
+    // Each entry in `pending_renders` is independent — `owned` is shared
+    // by-reference and otherwise everything the closure needs is owned
+    // by the entry. rayon handles work-stealing across cores; on chr20
+    // quickstart this drops the render wall time roughly proportional to
+    // CPU count.
+    use rayon::prelude::*;
+    let rendered: Vec<(usize, Vec<u8>)> = pending_renders
+        .par_iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            const READ_OVERLAP_BUFFER_BP: i64 = 5;
+            let query_start = p.variant.start - READ_OVERLAP_BUFFER_BP;
+            let query_end = p.variant.end + READ_OVERLAP_BUFFER_BP;
+            let window_reads: Vec<&OwnedRead> = owned
+                .iter()
+                .filter(|r| {
+                    let read_len_on_ref: i64 = r
+                        .cigar
+                        .iter()
+                        .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
+                        .map(|(_, l)| *l)
+                        .sum();
+                    let read_end = r.ref_start + read_len_on_ref;
+                    r.ref_start < query_end && read_end > query_start
+                })
+                .collect();
+            let alt_set: std::collections::HashSet<u8> = p
+                .variant
+                .alternate_bases
+                .iter()
+                .filter_map(|a| a.as_bytes().first().copied())
+                .collect();
+            let supports = |r: &OwnedRead| -> bool {
+                let mut ref_pos = r.ref_start;
+                let mut read_pos = 0usize;
+                for &(op, len) in &r.cigar {
+                    let len_us = len as usize;
+                    match op {
+                        'M' | '=' | 'X' => {
+                            if ref_pos <= p.variant_pos && p.variant_pos < ref_pos + len {
+                                let off = (p.variant_pos - ref_pos) as usize;
+                                if read_pos + off < r.seq.len() {
+                                    let b = r.seq[read_pos + off];
+                                    return alt_set.contains(&b);
+                                }
+                                return false;
+                            }
+                            ref_pos += len;
+                            read_pos += len_us;
+                        }
+                        'I' | 'S' => read_pos += len_us,
+                        'D' | 'N' => ref_pos += len,
+                        _ => {}
+                    }
+                }
+                false
+            };
+            let pileup_reads: Vec<PileupRead<'_>> = window_reads
+                .iter()
+                .map(|r| PileupRead {
+                    ref_start: r.ref_start,
+                    cigar: &r.cigar,
+                    seq: &r.seq,
+                    base_quality: &r.bq,
+                    mapping_quality: r.mq,
+                    is_reverse_strand: r.is_rev,
+                    fragment_length: r.frag,
+                    supports_variant: supports(r),
+                    hp_tag: r.hp,
+                    fragment_name: &r.name,
+                    read_number: r.mate - 1,
+                })
+                .collect();
+            let ctx = Some(VariantContext {
+                variant_pos: p.variant_pos,
+                min_base_quality_at_call: 10,
+            });
+            let img = render(
+                p.win_start,
+                width,
+                height,
+                5,
+                &p.img_ref,
+                &pileup_reads,
+                &kinds,
+                &opts,
+                ctx,
+                42,
+            );
+            let mut variant_with_call = p.variant.clone();
             if variant_with_call.calls.is_empty() {
                 variant_with_call.calls.push(Default::default());
             }
             variant_with_call.calls[0].call_set_name = sample_name.to_string();
-            let bytes = build_example(&variant_with_call, &alt_indices, &img);
-            writer.write_record(&bytes)?;
-            emitted += 1;
-        }
+            let bytes = build_example(&variant_with_call, &p.alt_indices, &img);
+            (idx, bytes)
+        })
+        .collect();
+
+    // ---- Pass 3 (serial): write in canonical (input) order ----
+    //
+    // par_iter preserves index order via `enumerate()`, but we explicitly
+    // sort by index here to keep the output deterministic regardless of
+    // rayon's scheduling.
+    let mut rendered = rendered;
+    rendered.sort_by_key(|(idx, _)| *idx);
+    for (_, bytes) in rendered {
+        writer.write_record(&bytes)?;
+        emitted += 1;
     }
     writer.flush()?;
     if let Some(mut w) = small_model_writer {

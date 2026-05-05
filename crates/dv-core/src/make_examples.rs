@@ -10,7 +10,7 @@
 //!   - `alt_allele_indices/encoded`: serialized
 //!     `CallVariantsOutput.AltAlleleIndices` proto
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use prost::Message;
 
@@ -25,7 +25,7 @@ pub fn build_example(variant: &Variant, alt_indices: &[i32], image: &[u8]) -> Ve
     let aai = AltAlleleIndices {
         indices: alt_indices.to_vec(),
     };
-    let mut feature_map: HashMap<String, Feature> = HashMap::new();
+    let mut feature_map: BTreeMap<String, Feature> = BTreeMap::new();
     feature_map.insert(
         "image/encoded".to_string(),
         bytes_feature(image.to_vec()),

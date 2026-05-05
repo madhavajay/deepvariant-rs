@@ -46,7 +46,7 @@ fn gvcf_byte_equal_to_upstream_chr20() {
         description: String::new(),
         n_bases: 63_025_520,
         pos_in_fasta: 0,
-        extra: std::collections::HashMap::new(),
+        extra: std::collections::BTreeMap::new(),
     }];
     let contig_index_map: std::collections::HashMap<String, u32> =
         contigs.iter().enumerate().map(|(i, c)| (c.name.clone(), i as u32)).collect();
