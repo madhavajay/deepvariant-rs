@@ -1310,6 +1310,338 @@ mod tests {
         assert_eq!(dp.positions, vec![100, 105, 110]);
     }
 
+    /// Helper used by the tests below: build a read list of N reads
+    /// named `read1`, …, `readN` with `read_number = 0`, matching the
+    /// upstream `CreateTestReads` convention.
+    fn test_reads(n: usize) -> Vec<(String, i32)> {
+        (1..=n).map(|i| (format!("read{}", i), 0)).collect()
+    }
+
+    /// Mirrors upstream `PhaseReadSimpleTest`.
+    #[test]
+    fn phase_reads_simple() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[("C", &["read1/0", "read2/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(5);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let phases = dp.phase_reads(&candidates, &reads);
+        assert_eq!(phases, vec![1, 1, 1, 2, 2]);
+    }
+
+    /// Mirrors upstream `PhaseReadWithErrorCorrection`. read3 supports
+    /// phase 1 at position 100 but switches to phase 2 alt at 110;
+    /// majority vote across all four positions still phases it as 1.
+    #[test]
+    fn phase_reads_with_error_correction() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[("C", &["read1/0", "read2/0", "read3/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0"]),
+                    ("G", &["read3/0", "read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                120,
+                121,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(5);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let phases = dp.phase_reads(&candidates, &reads);
+        assert_eq!(phases, vec![1, 1, 1, 2, 2]);
+    }
+
+    /// Mirrors upstream `PhaseReadChangedOrderOfAlleles`. Alleles
+    /// listed in different orders at different positions; phasing
+    /// should still find the same partition.
+    #[test]
+    fn phase_reads_changed_order_of_alleles() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[("C", &["read1/0", "read2/0", "read3/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read4/0", "read5/0"]),
+                    ("G", &["read1/0", "read2/0", "read3/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                120,
+                121,
+                &[
+                    ("G", &["read4/0", "read5/0"]),
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(5);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let phases = dp.phase_reads(&candidates, &reads);
+        assert_eq!(phases, vec![1, 1, 1, 2, 2]);
+    }
+
+    /// Mirrors upstream `PhaseReadUnphasedRead`. read3 covers one
+    /// allele in phase 1, one homozygous, then one in phase 2 — vote
+    /// is split, so its phase is 0.
+    #[test]
+    fn phase_reads_unphased_read() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[("C", &["read1/0", "read2/0", "read3/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0"]),
+                    ("G", &["read4/0", "read5/0", "read3/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(5);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let phases = dp.phase_reads(&candidates, &reads);
+        assert_eq!(phases, vec![1, 1, 0, 2, 2]);
+    }
+
+    /// Mirrors upstream `PhaseReadFullyConnectedGraph`. Three SNVs
+    /// all phased together with three reads per haplotype.
+    #[test]
+    fn phase_reads_fully_connected_graph() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0", "read6/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[
+                    ("C", &["read4/0", "read5/0", "read1/0"]),
+                    ("G", &["read2/0", "read3/0", "read6/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0", "read6/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(6);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let phases = dp.phase_reads(&candidates, &reads);
+        assert_eq!(phases, vec![1, 1, 1, 2, 2, 2]);
+    }
+
+    /// Mirrors upstream `FilterOneAlleleCandidate`. Single-allele
+    /// candidate with insufficient REF support is filtered out.
+    #[test]
+    fn filter_one_allele_candidate() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                101,
+                &[("C", &["read4/0", "read5/0", "read6/0"])],
+                &["read7/0"], // only 1 ref read — below MIN_REF_ALLELE_DEPTH
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0", "read6/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(7);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        dp.build(&candidates, &reads);
+        // No vertex should exist at position 100.
+        assert!(!dp.vertices_by_position.contains_key(&100));
+        assert!(dp.vertices_by_position.contains_key(&110));
+    }
+
+    /// Mirrors upstream `FilterCandidateWithIndel`. Candidate with
+    /// any INDEL allele is filtered out entirely.
+    #[test]
+    fn filter_candidate_with_indel() {
+        let candidates = vec![
+            make_candidate(
+                100,
+                102,
+                &[
+                    ("CC", &["read4/0", "read5/0", "read6/0"]),
+                    ("A", &["read1/0", "read2/0"]), // INDEL — disqualifies whole candidate
+                ],
+                &["read7/0"],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0", "read6/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let reads = test_reads(7);
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        dp.build(&candidates, &reads);
+        assert!(!dp.vertices_by_position.contains_key(&100));
+        assert!(dp.vertices_by_position.contains_key(&110));
+    }
+
+    /// Mirrors upstream `DirectPhasingReuseObject`. A second call to
+    /// `phase_reads` on the same instance with different candidates
+    /// should not be polluted by the first run.
+    #[test]
+    fn reuse_object() {
+        let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+        let reads = test_reads(5);
+        let c1 = vec![
+            make_candidate(
+                100,
+                101,
+                &[
+                    ("A", &["read1/0", "read2/0", "read3/0"]),
+                    ("C", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                105,
+                106,
+                &[("C", &["read1/0", "read2/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+            make_candidate(
+                110,
+                111,
+                &[
+                    ("T", &["read1/0", "read2/0", "read3/0"]),
+                    ("G", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+        ];
+        let phases = dp.phase_reads(&c1, &reads);
+        assert_eq!(phases, vec![1, 1, 1, 2, 2]);
+
+        // Second region with only one het + one homozygous candidate
+        // — neither side has enough info to phase.
+        let c2 = vec![
+            make_candidate(
+                120,
+                121,
+                &[
+                    ("G", &["read1/0", "read2/0", "read3/0"]),
+                    ("A", &["read4/0", "read5/0"]),
+                ],
+                &[],
+            ),
+            make_candidate(
+                130,
+                131,
+                &[("T", &["read1/0", "read2/0", "read3/0", "read4/0", "read5/0"])],
+                &[],
+            ),
+        ];
+        let phases2 = dp.phase_reads(&c2, &reads);
+        // Each read covers exactly one phasable allele (the het at
+        // 120) — under the default `min_alleles_to_phase=2`, that's
+        // not enough. All reads stay unphased.
+        assert_eq!(phases2, vec![0, 0, 0, 0, 0]);
+    }
+
     #[test]
     fn phase_reads_simple_two_phase() {
         // Three SNVs all phased together.
