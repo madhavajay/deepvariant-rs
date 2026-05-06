@@ -584,6 +584,82 @@ mod tests {
         }
     }
 
+    /// Mirrors upstream `TestStartingDeletions`. A read starting
+    /// with a deletion has no anchor inside the region — the
+    /// deletion event is silently dropped (we'd need a base before
+    /// the read's `ref_start` to anchor it on, and that's outside
+    /// the AlleleCount slice).
+    #[test]
+    fn read_starting_with_deletion_drops_the_event() {
+        let ref_bases = b"TCCGT";
+        let mut counts = empty_counts("chr1", 100, 105, ref_bases);
+        for (i, c) in counts.iter_mut().enumerate() {
+            c.ref_base = (ref_bases[i] as char).to_string();
+        }
+        let opts = CounterOptions::default();
+        let read = AlignedRead {
+            name: "r1",
+            mate_number: 1,
+            ref_start: 100,
+            cigar: &[('D', 1), ('M', 4)],
+            seq: b"CCGT",
+            base_quality: &[40u8; 4],
+            mapping_quality: 60,
+            is_reverse_strand: false,
+        };
+        add_read(&mut counts, &read, &opts, 100);
+        // Position 0 has no DEL allele (event at anchor=99 dropped).
+        assert!(counts[0].read_alleles.is_empty());
+        // Position 0 also has no ref-supporting count (the read
+        // skipped that position via the leading D).
+        assert_eq!(counts[0].ref_supporting_read_count, 0);
+        // Subsequent 4 positions are ref-matched.
+        for i in 1..5 {
+            assert_eq!(counts[i].ref_supporting_read_count, 1);
+        }
+    }
+
+    /// Mirrors upstream `TestMultipleReads`. Multiple reads on the
+    /// same position should accumulate independently (each adding to
+    /// either ref count or alt allele list).
+    #[test]
+    fn multiple_reads_accumulate() {
+        let ref_bases = b"AAAAA";
+        let mut counts = empty_counts("chr1", 100, 105, ref_bases);
+        let opts = CounterOptions::default();
+        // 5 ref-supporting reads.
+        for i in 0..5 {
+            let name = format!("ref{i}");
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 5)], b"AAAAA"),
+                &opts,
+                100,
+            );
+        }
+        // 3 alt-supporting reads (C at offset 2).
+        for i in 0..3 {
+            let name = format!("alt{i}");
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 5)], b"AACAA"),
+                &opts,
+                100,
+            );
+        }
+        // Position 2: 5 ref + 3 alt(C)
+        assert_eq!(counts[2].ref_supporting_read_count, 5);
+        assert_eq!(counts[2].read_alleles.len(), 3);
+        for a in counts[2].read_alleles.values() {
+            assert_eq!(a.bases, "C");
+            assert_eq!(a.r#type, AlleleType::Substitution as i32);
+        }
+        // Other positions: 8 ref each (5 ref + 3 alt-but-A).
+        for i in [0, 1, 3, 4] {
+            assert_eq!(counts[i].ref_supporting_read_count, 8);
+        }
+    }
+
     /// Mirrors upstream `TestDeletionSize2`. Verifies the DEL allele's
     /// `bases` field stores actual reference bases (anchor + deleted
     /// bases) rather than 'N' filler.
