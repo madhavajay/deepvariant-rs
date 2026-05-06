@@ -97,6 +97,11 @@ enum Cmd {
         /// right-truncated by overlapping variants.
         #[arg(long)]
         ref_fasta: Option<PathBuf>,
+        /// Optional input BAM. When present, runs direct phasing on the
+        /// variant calls and adds `0|1`/`1|0` GT separators + `PS`
+        /// (phase-set) info to records that fall in a phasing block.
+        #[arg(long)]
+        phase_reads: Option<PathBuf>,
     },
 }
 
@@ -138,6 +143,7 @@ fn main() -> Result<()> {
             sample_name,
             contigs,
             ref_fasta,
+            phase_reads,
         } => postprocess_variants(
             &cvo,
             small_model_cvo.as_deref(),
@@ -147,6 +153,7 @@ fn main() -> Result<()> {
             &sample_name,
             &contigs,
             ref_fasta.as_deref(),
+            phase_reads.as_deref(),
         ),
     }
 }
@@ -778,6 +785,202 @@ fn maybe_emit_tbi(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Run direct phasing on a list of called Variant records using the
+/// supplied BAM as the read source. Returns a new Vec with phased
+/// genotypes + PS tags applied to records that fall in a phasing block.
+///
+/// For each het SNV, walks reads overlapping the variant position to
+/// build a `DeepVariantCall.allele_support_ext` (alt → list of read
+/// keys) and a `ref_support_ext` (ref-supporting reads). Indel and
+/// homozygous variants are not phased — direct_phasing's
+/// `candidate_filter` skips them anyway.
+fn phase_called_variants(
+    variants: &[Variant],
+    bam_path: &std::path::Path,
+) -> Result<Vec<Variant>> {
+    use dv_core::direct_phasing::{DirectPhasing, DirectPhasingOptions};
+    use dv_core::phasing_apply::apply_to_variants;
+    use dv_proto::dv::deep_variant_call::{ReadSupport, SupportingReadsExt};
+    use dv_proto::dv::DeepVariantCall;
+    use noodles::sam::alignment::record::cigar::op::Kind as CigarKind;
+    use noodles::sam::alignment::record::QualityScores;
+
+    fn cigar_op_to_char(op: CigarKind) -> char {
+        match op {
+            CigarKind::Match => 'M',
+            CigarKind::Insertion => 'I',
+            CigarKind::Deletion => 'D',
+            CigarKind::Skip => 'N',
+            CigarKind::SoftClip => 'S',
+            CigarKind::HardClip => 'H',
+            CigarKind::Pad => 'P',
+            CigarKind::SequenceMatch => '=',
+            CigarKind::SequenceMismatch => 'X',
+        }
+    }
+
+    /// Sub-set of fields we need to do per-position read classification.
+    struct OwnedRead {
+        ref_start: i64,
+        cigar: Vec<(char, i64)>,
+        seq: Vec<u8>,
+        name: String,
+        mate: i32,
+    }
+
+    let (_h, mut reader) =
+        dv_io::bam::open(bam_path).context("open BAM for phasing")?;
+    let mut owned: Vec<OwnedRead> = Vec::new();
+    for rec in reader.records() {
+        let r = rec?;
+        let Some(start) = r.alignment_start() else { continue };
+        let start_0based = usize::from(start.unwrap()) as i64 - 1;
+        let flags = r.flags();
+        if flags.is_secondary()
+            || flags.is_supplementary()
+            || flags.is_unmapped()
+            || flags.is_duplicate()
+            || flags.is_qc_fail()
+        {
+            continue;
+        }
+        if r.mapping_quality().map(|q| q.get()).unwrap_or(255) < 10 {
+            continue;
+        }
+        let cigar_owned: Vec<(char, i64)> = r
+            .cigar()
+            .iter()
+            .filter_map(|op| {
+                let op = op.ok()?;
+                Some((cigar_op_to_char(op.kind()), op.len() as i64))
+            })
+            .collect();
+        let seq: Vec<u8> = r
+            .sequence()
+            .iter()
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+        let _q: Vec<u8> = r.quality_scores().iter().map(|q| q.unwrap_or(0)).collect();
+        let name = r
+            .name()
+            .map(|n| std::str::from_utf8(n.as_ref()).unwrap_or("").to_string())
+            .unwrap_or_default();
+        let mate = if flags.is_first_segment() { 1 } else { 2 };
+        owned.push(OwnedRead {
+            ref_start: start_0based,
+            cigar: cigar_owned,
+            seq,
+            name,
+            mate,
+        });
+    }
+    tracing::info!(reads_loaded = owned.len(), "phasing: loaded reads");
+
+    // Walk each candidate's overlapping reads, classify by base at the
+    // variant position, build a DeepVariantCall.
+    fn read_base_at(r: &OwnedRead, pos: i64) -> Option<u8> {
+        let mut ref_pos = r.ref_start;
+        let mut read_pos = 0usize;
+        for &(op, len) in &r.cigar {
+            let len_us = len as usize;
+            match op {
+                'M' | '=' | 'X' => {
+                    if ref_pos <= pos && pos < ref_pos + len {
+                        let off = (pos - ref_pos) as usize;
+                        return r.seq.get(read_pos + off).copied();
+                    }
+                    ref_pos += len;
+                    read_pos += len_us;
+                }
+                'I' | 'S' => read_pos += len_us,
+                'D' | 'N' => ref_pos += len,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    // Build a DeepVariantCall for every variant, keeping only those that
+    // direct_phasing's CandidateFilter would accept (≥2 called alleles
+    // or ≥3 REF reads, no INDELs).
+    let mut candidates: Vec<DeepVariantCall> = Vec::new();
+    let mut all_read_keys: std::collections::BTreeSet<(String, i32)> =
+        std::collections::BTreeSet::new();
+    for v in variants {
+        // Only het biallelic SNVs are useful — others fall through.
+        if v.reference_bases.len() != 1 {
+            continue;
+        }
+        if v.alternate_bases.is_empty() {
+            continue;
+        }
+        if v.alternate_bases.iter().any(|a| a.len() != 1) {
+            continue;
+        }
+        let ref_b = v.reference_bases.as_bytes()[0];
+        let mut ref_reads = Vec::new();
+        let mut alt_reads: std::collections::HashMap<String, Vec<ReadSupport>> =
+            std::collections::HashMap::new();
+        for alt in &v.alternate_bases {
+            alt_reads.insert(alt.clone(), Vec::new());
+        }
+        for r in &owned {
+            let read_overlaps = {
+                let read_len_on_ref: i64 = r
+                    .cigar
+                    .iter()
+                    .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
+                    .map(|(_, l)| *l)
+                    .sum();
+                r.ref_start <= v.start && v.start < r.ref_start + read_len_on_ref
+            };
+            if !read_overlaps {
+                continue;
+            }
+            let Some(b) = read_base_at(r, v.start) else { continue };
+            let b = b.to_ascii_uppercase();
+            let key = format!("{}/{}", r.name, r.mate - 1);
+            all_read_keys.insert((r.name.clone(), r.mate - 1));
+            if b == ref_b {
+                let mut rs = ReadSupport::default();
+                rs.read_name = key;
+                ref_reads.push(rs);
+            } else {
+                for alt in &v.alternate_bases {
+                    if alt.as_bytes()[0].to_ascii_uppercase() == b {
+                        let mut rs = ReadSupport::default();
+                        rs.read_name = key.clone();
+                        alt_reads.get_mut(alt).unwrap().push(rs);
+                        break;
+                    }
+                }
+            }
+        }
+        let mut allele_support_ext = std::collections::BTreeMap::new();
+        for (alt, reads) in alt_reads {
+            allele_support_ext.insert(alt, SupportingReadsExt { read_infos: reads });
+        }
+        let dv_call = DeepVariantCall {
+            variant: Some(v.clone()),
+            allele_support_ext,
+            ref_support_ext: Some(SupportingReadsExt { read_infos: ref_reads }),
+            ..Default::default()
+        };
+        candidates.push(dv_call);
+    }
+    candidates.sort_by_key(|c| c.variant.as_ref().map(|v| v.start).unwrap_or(0));
+    tracing::info!(phasing_candidates = candidates.len(), "running direct_phasing");
+
+    let read_list: Vec<(String, i32)> = all_read_keys.into_iter().collect();
+    let mut dp = DirectPhasing::new(DirectPhasingOptions::default());
+    let _phases = dp.phase_reads(&candidates, &read_list);
+    let phased = dp.phased_variants();
+    tracing::info!(phased_variants = phased.len(), "direct_phasing complete");
+
+    let out = apply_to_variants(&phased, variants);
+    Ok(out)
+}
+
 fn postprocess_variants(
     cvo: &std::path::Path,
     small_model_cvo: Option<&std::path::Path>,
@@ -787,6 +990,7 @@ fn postprocess_variants(
     sample_name: &str,
     contig_specs: &[String],
     ref_fasta: Option<&std::path::Path>,
+    phase_reads_path: Option<&std::path::Path>,
 ) -> Result<()> {
     tracing::info!(?cvo, ?output_vcf, ?output_gvcf, sample_name, "postprocess_variants");
     let contigs = parse_contigs(contig_specs)?;
@@ -799,8 +1003,15 @@ fn postprocess_variants(
     tracing::info!(loaded = cvos.len(), "loaded CVOs");
 
     let opts = PostprocessOptions::default();
-    let variants = postprocess::process_cvos_into_variants(cvos, sample_name, &opts);
+    let mut variants = postprocess::process_cvos_into_variants(cvos, sample_name, &opts);
     tracing::info!(produced = variants.len(), "produced variants");
+
+    // Optional: run direct phasing over the called variants using the
+    // input BAM, then apply the resulting `0|1` GTs and PS tags.
+    if let Some(bam_path) = phase_reads_path {
+        let phased = phase_called_variants(&variants, bam_path)?;
+        variants = phased;
+    }
 
     // VCF
     let mut vcf_writer = open_text_writer(output_vcf)?;
