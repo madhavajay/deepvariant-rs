@@ -1,3 +1,24 @@
 # NOTE: TF rpath embedding moved to crates/dv-cli/build.rs and is only
 # applied when the `tf` feature is enabled. Default builds use ORT via
 # load-dynamic and don't link any native ML library at all.
+
+# Run wasm32-wasip1 test/binary outputs via the wasmtime CLI so that
+# `cargo test --target wasm32-wasip1` JustWorks. wasmtime ships in
+# `pacman -S wasmtime` (or via `cargo install --locked wasmtime-cli`)
+# and gives the wasm binary stdout + exit codes, so a normal `#[test]`
+# attribute is sufficient — no wasm-bindgen-test runner needed.
+[target.wasm32-wasip1]
+runner = "wasmtime"
+
+# `cargo wasm-test` — run the wasm-buildable library tests through
+# wasmtime/WASI. Currently covers dv-core's pure-compute kernels (261
+# tests: allelecounter, variant_calling, channel encoders, realigner,
+# direct_phasing, methylation_aware_phasing, …) and dv-wasm (3 tests).
+#
+# The integration-test suite stays native-only because it loads BAM /
+# FASTA / VCF fixtures via noodles' I/O paths (which transitively pull
+# C-only deps for the CRAM codec). ORT inference also stays native:
+# ort 2.0.0-rc.12 has wasm32 support but only via a JS host bridge to
+# onnxruntime-web/-node — wasmtime alone has no ORT engine.
+[alias]
+wasm-test = "test --target wasm32-wasip1 --no-default-features --lib -p dv-core -p dv-wasm"

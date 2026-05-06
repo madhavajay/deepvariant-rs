@@ -2,9 +2,12 @@
 //!
 //! Mirrors `third_party/nucleus/io/merge_variants.cc`.
 
+#[cfg(feature = "io")]
 use std::path::Path;
 
+#[cfg(feature = "io")]
 use anyhow::{Context, Result};
+#[cfg(feature = "io")]
 use prost::Message;
 
 use dv_proto::nucleus_v1::{value, ListValue, Value, Variant};
@@ -98,7 +101,10 @@ pub fn transform_to_gvcf(variant: &mut Variant) {
     }
 }
 
-/// Read non-variant gVCF blocks from a TFRecord shard.
+/// Read non-variant gVCF blocks from a TFRecord shard. Behind the `io`
+/// feature so wasm builds (which can't link bgzf/flate2 without help)
+/// don't try to compile it.
+#[cfg(feature = "io")]
 pub fn load_nonvariants<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<Variant>> {
     let mut out = Vec::new();
     for p in paths {

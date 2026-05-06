@@ -1,0 +1,19 @@
+[package]
+name = "dv-wasm-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only crate (won't itself be built for wasm32). It loads the
+# wasm module produced by dv-wasm and times its execution side-by-side
+# with the same kernel running natively.
+[[bin]]
+name = "dv-wasm-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+# wasmtime — embeddable wasm runtime; no external `wasmtime` CLI required.
+wasmtime = "44"
+# Local re-import of the kernel so we can time it natively for comparison.
+dv-wasm = { path = "../dv-wasm", default-features = false }

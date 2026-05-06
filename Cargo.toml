@@ -6,6 +6,8 @@ members = [
     "crates/dv-infer",
     "crates/dv-core",
     "crates/dv-cli",
+    "crates/dv-wasm",
+    "crates/dv-wasm-bench",
 ]
 
 [workspace.package]
@@ -24,7 +26,7 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 prost = "0.13"
 prost-build = "0.13"
-noodles = { version = "0.92", features = ["bam", "cram", "sam", "vcf", "fasta", "bgzf", "csi", "tabix", "core"] }
+noodles = { version = "0.92", default-features = false, features = ["bam", "sam", "vcf", "fasta", "bgzf", "csi", "tabix", "core"] }
 crc32c = "0.6"
 flate2 = "1"
 rand = { version = "0.8", default-features = false }
@@ -32,8 +34,8 @@ rand_mt = { version = "5", default-features = false }
 rayon = "1"
 
 # Inference backends — gated by features in dv-infer
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
-ndarray = "0.16"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+ndarray = "0.17"
 tensorflow = "0.21"
 
 [profile.release]
