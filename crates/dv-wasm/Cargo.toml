@@ -1,0 +1,26 @@
+[package]
+name = "dv-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Browser/wasm32 target for the pure-compute pieces of dv-core.
+# `cdylib` so wasm-pack/wasm-bindgen can produce a `.wasm` + JS glue.
+# `rlib` keeps unit tests runnable on the native target as well.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default = build with wasm-bindgen JS interop. Off when running unit
+# tests natively so we don't pull in a wasm-only ABI.
+default = ["wasm-bindgen"]
+wasm-bindgen = ["dep:wasm-bindgen"]
+
+[dependencies]
+# dv-core with its `io` feature OFF (so no flate2 / noodles-cram).
+dv-core = { path = "../dv-core", default-features = false }
+dv-proto = { path = "../dv-proto" }
+prost.workspace = true
+
+# Optional — only needed for the browser glue layer.
+wasm-bindgen = { version = "0.2", optional = true }

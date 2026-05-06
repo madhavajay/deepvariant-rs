@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DeepVariant in the browser</title>
+<style>
+    body {
+        font: 14px/1.5 system-ui, -apple-system, sans-serif;
+        max-width: 960px;
+        margin: 2em auto;
+        padding: 0 1em;
+        color: #1a1a1a;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.2em; }
+    h1 small { color: #666; font-weight: normal; font-size: 0.9rem; }
+    .field { margin: 1em 0; }
+    .field label { display: block; font-weight: 600; margin-bottom: 0.3em; }
+    button { padding: 0.5em 1em; font-size: 14px; }
+    #status { font-family: ui-monospace, Menlo, monospace; padding: 0.5em; background: #f5f5f5; border-radius: 4px; min-height: 1.5em; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1em; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+    th, td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #f5f5f5; }
+    .pass { color: #2a7a2a; }
+    .fail { color: #c33; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>DeepVariant in the browser <small>— dv-wasm + onnxruntime-web</small></h1>
+
+<p>Pick a <code>tf.Example</code> shard (gzipped TFRecord, e.g.
+<code>testdata/quickstart_chr20_norealign/examples.tfrecord.gz</code>).
+The page decodes each example via the <code>dv-wasm</code> Rust port,
+runs the WGS ONNX model with onnxruntime-web, and prints the
+3-class probabilities. If <code>expected.json</code> is present,
+results are diffed against the native <code>dv call-variants</code>
+reference.</p>
+
+<div class="field">
+    <label for="file">tf.Example shard (.tfrecord.gz)</label>
+    <input id="file" type="file" accept=".gz">
+    <button id="run-default" type="button">…or load testdata/examples.tfrecord.gz</button>
+</div>
+
+<div class="field">
+    <label>status</label>
+    <div id="status">idle</div>
+</div>
+
+<div id="summary"></div>
+<table id="results" hidden>
+    <thead><tr>
+        <th>#</th><th>variant pos</th><th>top class</th><th>probabilities</th><th>Δ vs native</th><th>status</th>
+    </tr></thead>
+    <tbody></tbody>
+</table>
+
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>

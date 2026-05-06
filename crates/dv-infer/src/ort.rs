@@ -32,15 +32,15 @@ impl OrtBackend {
             .map_err(|e| InferError::Backend(format!("load model: {e}")))?;
 
         let input = session
-            .inputs
+            .inputs()
             .first()
             .ok_or_else(|| InferError::Backend("no inputs".into()))?;
         let output = session
-            .outputs
+            .outputs()
             .first()
             .ok_or_else(|| InferError::Backend("no outputs".into()))?;
-        let input_name = input.name.clone();
-        let output_name = output.name.clone();
+        let input_name = input.name().to_string();
+        let output_name = output.name().to_string();
 
         // Hard-code the WGS model shape — this matches example_info.json.
         // (ONNX exports often store dynamic batch as None; we just trust the
@@ -119,15 +119,15 @@ impl SmallModelOrt {
             .commit_from_file(onnx_path.as_ref())
             .map_err(|e| InferError::Backend(format!("load model: {e}")))?;
         let input = session
-            .inputs
+            .inputs()
             .first()
             .ok_or_else(|| InferError::Backend("no inputs".into()))?;
         let output = session
-            .outputs
+            .outputs()
             .first()
             .ok_or_else(|| InferError::Backend("no outputs".into()))?;
-        let input_name = input.name.clone();
-        let output_name = output.name.clone();
+        let input_name = input.name().to_string();
+        let output_name = output.name().to_string();
         // Trust upstream's WGS small-model spec: 70 features, 3 classes.
         // (Reading shape out of `input.input_type` would let us
         //  auto-detect, but the `ort` 2.0-rc.10 API is awkward and the

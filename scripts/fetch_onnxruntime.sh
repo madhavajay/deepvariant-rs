@@ -6,14 +6,19 @@
 # Idempotent: if models/lib/libonnxruntime.so.1 (Linux) or
 # .../libonnxruntime.dylib (macOS) already exists, the script is a no-op.
 #
-# Override the version with ORT_VERSION=1.22.0 ./scripts/fetch_onnxruntime.sh
+# Override the version with ORT_VERSION=1.24.4 ./scripts/fetch_onnxruntime.sh
+#
+# Default tracks the version pinned by the `ort` Rust crate in
+# Cargo.toml — currently 2.0.0-rc.12, which targets ONNX Runtime 1.24.
+# Older runtimes (e.g. 1.22) deadlock on rc.12's session init because
+# ort calls ABI symbols that don't exist in older libonnxruntime.
 #
 # Pre-built artifacts come from the official Microsoft release page:
 # https://github.com/microsoft/onnxruntime/releases — no compilation needed.
 
 set -euo pipefail
 
-ORT_VERSION="${ORT_VERSION:-1.22.0}"
+ORT_VERSION="${ORT_VERSION:-1.24.4}"
 
 # Resolve the workspace root from this script's own location so the
 # script works regardless of where it's invoked from.
@@ -77,7 +82,7 @@ echo "Extracting ${archive}"
 tar -xf "${tmp}/${archive}" -C "${tmp}"
 
 # Copy lib/ contents and preserve the symlink chain so .so / .so.1 /
-# .so.1.22.0 all resolve correctly.
+# .so.<version> all resolve correctly.
 cp -a "${tmp}/${slug}/lib/." "${LIB_DIR}/"
 
 echo "Installed ONNX Runtime ${ORT_VERSION} → ${LIB_DIR}"
