@@ -67,8 +67,11 @@ left:
 - [x] CH_SUPPLEMENTARY_ALIGNMENT (#26) — encoder done; needs SAM flag wiring
 - [x] CH_ALLELE_SAMPLE_PROBABILITY (#27) — encoder done; needs allele-support
       counts threaded from candidate to pileup row
-- [x] CH_READ_SUPPORTS_VARIANT_FUZZY (#25) — encoder done; needs HP/PS/ALT_PS
-      classifier (computes the support code from phasing info)
+- [x] CH_READ_SUPPORTS_VARIANT_FUZZY (#25) — encoder done. Classifier
+      (`fuzzy_support::classify_read_support`) ported as a self-contained
+      helper that takes plain Rust types (variant_alts, allele_support,
+      alt_phases, read_key, read_hp). 12 unit tests; needs HP/ALT_PS
+      plumbing through the candidate path to wire end-to-end.
 
 ## P3 — broader coverage / robustness
 
