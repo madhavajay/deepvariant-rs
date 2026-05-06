@@ -5,14 +5,12 @@ that's still outstanding, grouped by impact.
 
 ## P0 — closes the last accuracy gap on chr20 quickstart
 
-- [ ] **Small-model fast path.** Upstream routes ~60 of 84 chr20
-  candidates through a lightweight Keras model (`/opt/smallmodels/wgs/
-  model.keras`) tagged `MID=small_model`, falling back to the large
-  WGS CNN only for hard cases. We currently send everything through
-  the large model. PASS classification still matches but PL/GQ values
-  differ for those records. Needed: load the small model (likely via
-  `tract`/`burn` or another keras→ort path), implement the fast-path
-  decision logic from `make_examples_core.py`.
+- [x] **Small-model fast path.** Ported `make_small_model_examples.py`
+  feature engineering + keras→ONNX export + ORT inference + threshold
+  decision. `dv make-examples --small-model` routes biallelic SNVs
+  through the small model first; on chr20 quickstart 196 of 364
+  candidates take the fast path. End-to-end test in
+  `crates/dv-cli/tests/small_model_fast_path.rs`.
 
 - [x] **Wire realigner into `dv make-examples` candidate flow.**
   Now called inline (window selector → de Bruijn assembly →
@@ -23,10 +21,14 @@ that's still outstanding, grouped by impact.
 
 ## P1 — pileup parity edge cases (currently 100% on chr20:10001019)
 
-- [ ] **Alt-aligned pileups.** When `--alt_aligned_pileup=diff_channels`
-  or `=base_channels`, upstream re-renders the pileup with reads
-  aligned to the alt haplotype and stacks 2 extra channels (#9, #10
-  for diff; #20, #21 for base). Adds two channels to the model input.
+- [x] **Alt-aligned pileups (library code).** `dv_core::alt_aligned_pileup`
+  ports `trim_cigar`, `trim_read`, `trim_reads`,
+  `calculate_alignment_region`, `cigar_ref/read_length` from
+  `alt_aligned_pileup_lib.cc`. 18 unit tests cover the upstream
+  parameterized test cases. Wiring this re-render path through to the
+  pileup builder so channels #9/#10/#20/#21 actually populate is the
+  remaining piece (requires plumbing FastPassAligner output back into
+  the per-candidate render loop).
 
 - [x] **Run pileup byte-diff on more variants.** Sweep harness now runs
   all 32 norealign upstream examples; current state is 100% on the SNV
@@ -74,14 +76,22 @@ left:
   segments and confirm parity. Run on a different model (WES) and
   confirm. Add to CI.
 
-- [ ] **`direct_phasing.cc` port** (~38k bytes). Read-based phasing.
-  Needed for `MID=phased` annotations and the gVCF `PS` tag.
+- [x] **`direct_phasing.cc` port** (1006 LOC). DP-based read phasing
+  graph with backtracking and broken-path handling. 25 unit tests
+  cover the upstream `*_test.cc` cases. `dv_core::direct_phasing`.
 
-- [ ] **`methylation_aware_phasing.cc` port.** Methylation-tag phasing.
+- [x] **`methylation_aware_phasing.cc` port** (483 LOC). Wilcoxon
+  rank-sum test (with Abramowitz–Stegun erf), informative-site
+  filter, per-read voting, iterative phasing loop. 11 unit tests.
+  `dv_core::methylation_aware_phasing`.
 
-- [ ] **Multi-shard / multi-region parallelism.** Use `rayon` to run
-  candidate calling per-region in parallel. Upstream uses GNU
-  `parallel` to shard `make_examples` over CPU cores.
+- [x] **Multi-shard / multi-region parallelism.** rayon-parallel
+  per-candidate image rendering in `dv make-examples` (Pass 1
+  decisions / Pass 2 parallel render / Pass 3 sequential write). New
+  `tests/make_examples_determinism.rs` confirms parallel and serial
+  shards are byte-identical (BTreeMap-encoded tf.Example). Upstream
+  GNU-parallel-shard-by-region remains as a separate orchestration
+  layer; can be added at the dv-cli level if needed.
 
 - [ ] **CRAM support.** `noodles-cram` instead of just BAM.
 
@@ -106,9 +116,11 @@ left:
   `noodles-tabix`. `dv postprocess-variants` now writes
   `<output>.vcf.gz.tbi` (and `.g.vcf.gz.tbi`) automatically.
 
-- [ ] **`make_examples_call_variant_outputs.tfrecord` output.** When
-  the small-model fast path is implemented, also emit the small-model
-  CVO shard upstream produces.
+- [x] **`make_examples_call_variant_outputs.tfrecord` output.** Done
+  alongside the small-model fast path — `dv make-examples
+  --small-model-cvo <path>` writes the CVO shard for accepted
+  candidates with `MID=small_model`, ready to be merged with the
+  big-model CVO via `dv postprocess-variants --small-model-cvo`.
 
 ## P5 — Cross-compile (M4)
 

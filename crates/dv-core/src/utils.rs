@@ -121,4 +121,13 @@ mod tests {
         assert_eq!(allele_type_from_alt("AC", "A"), AlleleType::Deletion);
         assert_eq!(allele_type_from_alt("A", "A"), AlleleType::Reference);
     }
+
+    /// Mirrors upstream `UtilsTest::TestSimplifyRefAlt`.
+    #[test]
+    fn simplify_ref_alt_upstream_cases() {
+        assert_eq!(simplify_ref_alt("CAA", "CA"), "CA->C");
+        assert_eq!(simplify_ref_alt("CA", "C"), "CA->C");
+        assert_eq!(simplify_ref_alt("ATGTG", "ATGTGTGTGTGTG"), "A->ATGTGTGTG");
+        assert_eq!(simplify_ref_alt("C", "C"), "C->C");
+    }
 }
