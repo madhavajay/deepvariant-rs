@@ -23,6 +23,7 @@ noodles.workspace = true
 prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+rayon.workspace = true
 dv-core = { path = "../dv-core" }
 dv-io = { path = "../dv-io" }
 dv-infer = { path = "../dv-infer", default-features = false }

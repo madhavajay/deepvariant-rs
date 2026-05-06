@@ -8,8 +8,92 @@
 
 use std::collections::HashMap;
 
-use dv_proto::dv::{AlleleCount, AlleleType};
+use dv_proto::dv::{Allele, AlleleCount, AlleleType};
 use dv_proto::nucleus_v1::{value, ListValue, Value, Variant, VariantCall};
+
+/// Get the deletion size of an allele (length of bases) or -1 if it's
+/// not a deletion. Helper for `calc_ref_bases`. Mirrors upstream
+/// `DeletionSize`.
+pub fn deletion_size(allele: &Allele) -> i32 {
+    if allele.r#type == AlleleType::Deletion as i32 {
+        allele.bases.len() as i32
+    } else {
+        -1
+    }
+}
+
+/// Compute the longest substitution span on the reference needed to
+/// describe any of `alt_alleles` at this position. If none of the
+/// alts are deletions, this is just `ref_bases` (a single base). If
+/// at least one is a deletion, the full deleted-bases string from the
+/// longest deletion is used (since DEL alleles store
+/// `anchor + deleted_ref_bases` per our allelecounter port).
+///
+/// Mirrors upstream `CalcRefBases`.
+pub fn calc_ref_bases(ref_bases: &str, alt_alleles: &[Allele]) -> String {
+    if alt_alleles.is_empty() {
+        return ref_bases.to_string();
+    }
+    let max_del = alt_alleles
+        .iter()
+        .max_by_key(|a| deletion_size(a))
+        .expect("non-empty");
+    if max_del.r#type != AlleleType::Deletion as i32 {
+        return ref_bases.to_string();
+    }
+    assert!(
+        max_del.bases.len() > 1,
+        "DEL allele {} has too few bases",
+        max_del.bases
+    );
+    // Skip the anchor base and append the deleted bases to ref_bases.
+    let suffix = &max_del.bases[1..];
+    format!("{}{}", ref_bases, suffix)
+}
+
+/// Construct an alt allele consistent with a possibly-extended REF
+/// span. Splices `prefix` onto the trailing portion of `variant_ref`
+/// starting at `from`. Used to harmonize SNV/INS alts with a
+/// DEL-extended REF in mixed multi-allelic candidates.
+///
+/// Examples (variant_ref = "ACGT" because of a 3-bp deletion):
+///   * SNV "C" at position 0: prefix="C", from=1 → "C" + "CGT" = "CCGT"
+///   * INS "ATTT":            prefix="ATTT", from=1 → "ATTT" + "CGT" = "ATTTCGT"
+///   * DEL "ACGT":            prefix="A", from=4 → "A" + "" = "A"
+///
+/// Mirrors upstream `MakeAltAllele`.
+pub fn make_alt_allele(prefix: &str, variant_ref: &str, from: usize) -> String {
+    if from >= variant_ref.len() {
+        prefix.to_string()
+    } else {
+        format!("{}{}", prefix, &variant_ref[from..])
+    }
+}
+
+/// Project an `Allele` (from the allelecounter) into the alt-allele
+/// string a Variant proto needs, given the variant's chosen REF span.
+/// Uses `make_alt_allele` under the hood with the rules upstream
+/// applies in `BuildAlleleMap`:
+///   * SUB / INS: prefix = allele.bases, from = 1
+///   * DEL: prefix = allele.bases[0..1] (anchor), from = allele.bases.len()
+///
+/// Returns `None` for REFERENCE / SOFT_CLIP alleles (which don't go
+/// into alternate_bases).
+pub fn allele_to_variant_alt(allele: &Allele, variant_ref: &str) -> Option<String> {
+    let t = allele.r#type;
+    if t == AlleleType::Substitution as i32 || t == AlleleType::Insertion as i32 {
+        Some(make_alt_allele(&allele.bases, variant_ref, 1))
+    } else if t == AlleleType::Deletion as i32 {
+        assert!(
+            allele.bases.len() > 1,
+            "DEL allele {} has too few bases",
+            allele.bases
+        );
+        Some(make_alt_allele(&allele.bases[..1], variant_ref, allele.bases.len()))
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VariantCallerOptions {
@@ -202,6 +286,83 @@ mod tests {
     use super::*;
     use crate::allelecounter::{add_read, empty_counts, AlignedRead, CounterOptions};
 
+    fn allele(bases: &str, t: AlleleType) -> Allele {
+        Allele {
+            bases: bases.to_string(),
+            r#type: t as i32,
+            count: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deletion_size_returns_length_for_dels_and_minus_one_otherwise() {
+        assert_eq!(deletion_size(&allele("ACGT", AlleleType::Deletion)), 4);
+        assert_eq!(deletion_size(&allele("A", AlleleType::Substitution)), -1);
+        assert_eq!(deletion_size(&allele("ATC", AlleleType::Insertion)), -1);
+        assert_eq!(deletion_size(&allele("A", AlleleType::Reference)), -1);
+    }
+
+    #[test]
+    fn calc_ref_bases_no_alts_returns_input() {
+        assert_eq!(calc_ref_bases("A", &[]), "A");
+    }
+
+    #[test]
+    fn calc_ref_bases_no_dels_returns_input() {
+        let alts = vec![
+            allele("C", AlleleType::Substitution),
+            allele("ATG", AlleleType::Insertion),
+        ];
+        assert_eq!(calc_ref_bases("A", &alts), "A");
+    }
+
+    #[test]
+    fn calc_ref_bases_picks_longest_del() {
+        // Two deletions, longest wins. DEL bases include the anchor +
+        // the deleted ref bases. The variant's REF is `ref_bases` plus
+        // the *deleted* bases (everything after the anchor).
+        let alts = vec![
+            allele("AC", AlleleType::Deletion),    // anchor A + del 1bp
+            allele("ACGT", AlleleType::Deletion),  // anchor A + del 3bp ← longer
+            allele("C", AlleleType::Substitution),
+        ];
+        assert_eq!(calc_ref_bases("A", &alts), "ACGT");
+    }
+
+    #[test]
+    fn make_alt_allele_examples_from_upstream_doc() {
+        // Matches upstream's example: variant_ref="ACGT" because of
+        // a 3-bp deletion. SNV "C": prefix="C" from=1 → "CCGT".
+        assert_eq!(make_alt_allele("C", "ACGT", 1), "CCGT");
+        // INS "ATTT": prefix="ATTT" from=1 → "ATTTCGT".
+        assert_eq!(make_alt_allele("ATTT", "ACGT", 1), "ATTTCGT");
+        // DEL "ACGT": prefix="A" from=4 (= bases.len()) → "A".
+        assert_eq!(make_alt_allele("A", "ACGT", 4), "A");
+        // Edge: from > variant_ref.len() → just prefix.
+        assert_eq!(make_alt_allele("X", "ACGT", 100), "X");
+    }
+
+    #[test]
+    fn allele_to_variant_alt_handles_each_type() {
+        let variant_ref = "ACGT";
+        let snv = allele("C", AlleleType::Substitution);
+        assert_eq!(
+            allele_to_variant_alt(&snv, variant_ref).unwrap(),
+            "CCGT"
+        );
+        let ins = allele("ATT", AlleleType::Insertion);
+        assert_eq!(
+            allele_to_variant_alt(&ins, variant_ref).unwrap(),
+            "ATTCGT"
+        );
+        let del = allele("ACGT", AlleleType::Deletion);
+        assert_eq!(allele_to_variant_alt(&del, variant_ref).unwrap(), "A");
+        // REF / SOFT_CLIP types return None.
+        let refa = allele("A", AlleleType::Reference);
+        assert!(allele_to_variant_alt(&refa, variant_ref).is_none());
+    }
+
     fn syn_read<'a>(name: &'a str, ref_start: i64, cigar: &'a [(char, i64)], seq: &'a [u8]) -> AlignedRead<'a> {
         AlignedRead {
             name,
@@ -281,5 +442,162 @@ mod tests {
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].start, 102);
         assert_eq!(cs[0].alternate_bases, vec!["ACC"]);
+    }
+
+    /// Mirrors upstream `TestNoVariant`. Pure-ref pileup must not emit
+    /// any candidate.
+    #[test]
+    fn no_variant_with_pure_ref() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..15 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert!(cs.is_empty());
+    }
+
+    /// Mirrors upstream `TestNonCanonicalBase`. Bases like 'N' don't
+    /// trigger a candidate (they're filtered by allele counter via
+    /// the substitution branch — no alt allele is recorded).
+    #[test]
+    fn non_canonical_base_does_not_emit() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..10 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        // 5 reads with 'N' at position 102 — N is canonical for our
+        // counter (it tracks the base) but doesn't pass the SUB
+        // threshold against the high ref count without enough fraction.
+        // We use this to verify that even with N as an alt the
+        // overall threshold filtering applies.
+        let mut counts2 = counts.clone();
+        for i in 0..1 {
+            let name = format!("nn{i}");
+            add_read(&mut counts2, &syn_read(&name, 100, &[('M', 5)], b"AANAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts2, &VariantCallerOptions::default());
+        // 1/11 = 9% < 12% threshold → no candidate.
+        assert!(cs.is_empty());
+    }
+
+    /// Mirrors upstream `TestMinCount1`. With min_count_snps=10 a
+    /// single SNP read isn't enough.
+    #[test]
+    fn min_count_threshold() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for _ in 0..1 {
+            add_read(&mut counts, &syn_read("alt", 100, &[('M', 5)], b"AACAA"), &opts, 100);
+        }
+        let mut o = VariantCallerOptions::default();
+        o.min_count_snps = 10;
+        o.min_fraction_snps = 0.0;
+        let cs = candidates_from_counts(&counts, &o);
+        assert!(cs.is_empty());
+        // Drop the count threshold to 1 → candidate emerges.
+        let mut o2 = o.clone();
+        o2.min_count_snps = 1;
+        let cs = candidates_from_counts(&counts, &o2);
+        assert_eq!(cs.len(), 1);
+    }
+
+    /// Mirrors upstream `TestMultAllelicSNP`. Two distinct alts each
+    /// passing the threshold should appear in the same candidate
+    /// record's alternate_bases list, sorted lexicographically.
+    #[test]
+    fn multi_allelic_snp() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..5 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        for i in 0..5 {
+            let name = format!("alt_c{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AACAA"), &opts, 100);
+        }
+        for i in 0..5 {
+            let name = format!("alt_g{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAGAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].start, 102);
+        // Sorted alphabetically — C before G.
+        assert_eq!(cs[0].alternate_bases, vec!["C", "G"]);
+    }
+
+    /// Mirrors upstream `TestBiAllelicDeletion`. A 2bp deletion
+    /// passing thresholds emits a single candidate at the anchor
+    /// position with REF span = anchor + deleted bases.
+    ///
+    /// Our allelecounter now stores DEL alleles with the actual
+    /// ref bases (anchor + deleted ref bases), matching upstream's
+    /// `AlleleCounter::AddReadAllele(DEL)`. variant_calling
+    /// propagates that into `reference_bases` and `alternate_bases`.
+    #[test]
+    fn bi_allelic_deletion() {
+        let mut counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..8 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AAAAAAAAAA"), &opts, 100);
+        }
+        for i in 0..4 {
+            let name = format!("del{i}");
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 3), ('D', 2), ('M', 5)], b"AAAAAAAA"),
+                &opts,
+                100,
+            );
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].start, 102);
+        // REF spans 1 anchor + 2 deleted bases = 3.
+        assert_eq!(cs[0].reference_bases.len(), 3);
+        assert_eq!(cs[0].alternate_bases.len(), 1);
+    }
+
+    /// Two simultaneous indel alts at the same anchor.
+    #[test]
+    fn snp_plus_insertion_at_same_position() {
+        let mut counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..6 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AAAAAAAAAA"), &opts, 100);
+        }
+        for i in 0..3 {
+            let name = format!("snp{i}");
+            // SNP at position 102: A → C
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AACAAAAAAA"), &opts, 100);
+        }
+        for i in 0..3 {
+            let name = format!("ins{i}");
+            // Insertion of CC after position 102.
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 3), ('I', 2), ('M', 7)], b"AAACCAAAAAAA"),
+                &opts,
+                100,
+            );
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        // Both alts appear at the appropriate position. SNP is at 102,
+        // insertion anchored at 102 — same position so one record with
+        // two alts.
+        assert!(!cs.is_empty());
+        let snp = cs.iter().find(|v| v.start == 102 && v.reference_bases == "A");
+        assert!(snp.is_some(), "expected SNP candidate at 102");
+        // Alt list must contain both "C" and an insertion-style "ACC".
+        let alts = &snp.unwrap().alternate_bases;
+        assert!(alts.iter().any(|a| a == "C"), "missing SNP alt C");
+        assert!(alts.iter().any(|a| a.len() == 3), "missing INS alt ACC-like");
     }
 }

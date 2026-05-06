@@ -45,7 +45,7 @@ fn parse_example(payload: &[u8]) -> ExampleRow {
     let features = ex.features.expect("tf.Example must have features");
 
     fn bytes_value<'a>(
-        features: &'a std::collections::HashMap<String, dv_proto::tf::Feature>,
+        features: &'a std::collections::BTreeMap<String, dv_proto::tf::Feature>,
         key: &str,
     ) -> &'a [u8] {
         let f = features.get(key).unwrap_or_else(|| panic!("missing key {key}"));

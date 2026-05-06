@@ -42,7 +42,7 @@ fn postprocess_byte_equal_to_upstream_chr20() {
         description: String::new(),
         n_bases: 63_025_520,
         pos_in_fasta: 0,
-        extra: std::collections::HashMap::new(),
+        extra: std::collections::BTreeMap::new(),
     }];
     vcf::write_header(&mut out, &contigs, &["NA12878"]).unwrap();
     for v in &variants {

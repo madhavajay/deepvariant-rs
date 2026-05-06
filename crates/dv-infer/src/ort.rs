@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 
-use ndarray::Array4;
+use ndarray::{Array2, Array4};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 
@@ -92,5 +92,90 @@ impl InferenceBackend for OrtBackend {
 
     fn num_classes(&self) -> usize {
         self.num_classes
+    }
+}
+
+/// ORT backend for the small-model fast path. Same `Session` machinery as
+/// `OrtBackend` but the input is a 2-D `[batch, feature_dim]` feature
+/// matrix rather than a 4-D NHWC image batch. Output is `[batch, 3]`
+/// softmax probabilities (REF, HET, HOM_ALT).
+///
+/// Doesn't implement `InferenceBackend` because its input contract is
+/// different — keeping it as a sibling type keeps both signatures clean.
+pub struct SmallModelOrt {
+    session: RefCell<Session>,
+    input_name: String,
+    output_name: String,
+    feature_dim: usize,
+    num_classes: usize,
+}
+
+impl SmallModelOrt {
+    pub fn load(onnx_path: impl AsRef<Path>) -> Result<Self, InferError> {
+        let session = Session::builder()
+            .map_err(|e| InferError::Backend(format!("ort builder: {e}")))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| InferError::Backend(format!("opt level: {e}")))?
+            .commit_from_file(onnx_path.as_ref())
+            .map_err(|e| InferError::Backend(format!("load model: {e}")))?;
+        let input = session
+            .inputs
+            .first()
+            .ok_or_else(|| InferError::Backend("no inputs".into()))?;
+        let output = session
+            .outputs
+            .first()
+            .ok_or_else(|| InferError::Backend("no outputs".into()))?;
+        let input_name = input.name.clone();
+        let output_name = output.name.clone();
+        // Trust upstream's WGS small-model spec: 70 features, 3 classes.
+        // (Reading shape out of `input.input_type` would let us
+        //  auto-detect, but the `ort` 2.0-rc.10 API is awkward and the
+        //  numbers are stable across the upstream ports.)
+        let feature_dim = 70;
+        let num_classes = 3;
+        Ok(Self {
+            session: RefCell::new(session),
+            input_name,
+            output_name,
+            feature_dim,
+            num_classes,
+        })
+    }
+
+    pub fn feature_dim(&self) -> usize {
+        self.feature_dim
+    }
+
+    pub fn num_classes(&self) -> usize {
+        self.num_classes
+    }
+
+    /// Run inference on a flat row-major `[n, feature_dim]` matrix and
+    /// return a flat `[n, num_classes]` probability matrix.
+    pub fn predict(&self, features: &[f32], n: usize) -> Result<Vec<f32>, InferError> {
+        let expected = n * self.feature_dim;
+        if features.len() != expected {
+            return Err(InferError::Backend(format!(
+                "input length {} != expected {}",
+                features.len(),
+                expected
+            )));
+        }
+        let arr = Array2::from_shape_vec((n, self.feature_dim), features.to_vec())
+            .map_err(|e| InferError::Backend(format!("ndarray shape: {e}")))?;
+        let input = Tensor::from_array(arr.into_dyn())
+            .map_err(|e| InferError::Backend(format!("ort tensor: {e}")))?;
+        let mut sess = self.session.borrow_mut();
+        let outputs = sess
+            .run(ort::inputs![self.input_name.as_str() => input])
+            .map_err(|e| InferError::Backend(format!("session.run: {e}")))?;
+        let out = outputs
+            .get(self.output_name.as_str())
+            .ok_or_else(|| InferError::Backend("missing output".into()))?;
+        let (_shape, data) = out
+            .try_extract_tensor::<f32>()
+            .map_err(|e| InferError::Backend(format!("extract: {e}")))?;
+        Ok(data.to_vec())
     }
 }

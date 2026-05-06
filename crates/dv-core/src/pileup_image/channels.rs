@@ -214,10 +214,11 @@ pub fn homopolymer_weighted_ref_at(ref_bases: &[u8], col: usize) -> u8 {
 }
 
 /// Channel 16: is_homopolymer. 254 if position is part of a homopolymer
-/// run of length >= 2, else 0.
+/// run of length >= 3, else 0. Threshold matches upstream's
+/// `IsHomopolymerChannel::IsHomopolymer` (looks at 3-base windows).
 pub fn is_homopolymer_read_at(seq: &[u8], read_pos: usize) -> u8 {
     let weights = homopolymer_weights(seq);
-    if weights.get(read_pos).copied().unwrap_or(0) >= 2 {
+    if weights.get(read_pos).copied().unwrap_or(0) >= 3 {
         MAX_PIXEL_VALUE as u8
     } else {
         0
@@ -646,6 +647,51 @@ mod tests {
         assert_eq!(identity_read(vec![], 0), 0);
     }
 
+    /// Mirrors upstream `IdentityTest::PacBioStyleCigar`:
+    /// `"5=", "1X", "4="` → identity = 90% → scale_color(90, 100).
+    #[test]
+    fn identity_pacbio_style_cigar() {
+        let cigar = vec![('=', 5), ('X', 1), ('=', 4)];
+        assert_eq!(identity_read(cigar, 10), scale_color(90, 100));
+    }
+
+    /// Mirrors upstream `GapCompressedIdentityTest::DeletionCase`:
+    /// `"3M", "4D", "3M"` → matches=6, indel runs=1 → 6/7 ≈ 85.7%.
+    #[test]
+    fn gap_compressed_identity_deletion_case() {
+        let cigar = vec![('M', 3), ('D', 4), ('M', 3)];
+        let v = gap_compressed_identity_read(cigar);
+        // 6 / (6 + 0 + 1) = 6/7 ≈ 85.71%; scaled: 254 * 6/7 ≈ 217.7 → 217.
+        assert!((215..=220).contains(&v), "got {v}");
+    }
+
+    /// Mirrors upstream `GapCompressedIdentityTest::PacBioStyleCigar`:
+    /// `"3=", "2X", "2I", "3="` → matches=6, mismatches=2, indel runs=1
+    /// → 6/9 ≈ 67%.
+    #[test]
+    fn gap_compressed_identity_pacbio_style_cigar() {
+        let cigar = vec![('=', 3), ('X', 2), ('I', 2), ('=', 3)];
+        let v = gap_compressed_identity_read(cigar);
+        let expected = scale_color(66, 100); // (6*100)/9 = 66.66 → trunc 66
+        // upstream's int division yields 66, not 67.
+        assert!(
+            (v as i32 - expected as i32).abs() <= 2,
+            "got {v} expected near {expected}"
+        );
+    }
+
+    /// Mirrors upstream `AvgBaseQualityTest::BasicCase`. Read of 10
+    /// bases with quality 1..=10 → mean = 55/10 = 5 → scaled.
+    #[test]
+    fn avg_base_quality_upstream_basic_case() {
+        let q: Vec<u8> = (1..=10u8).collect();
+        let v = avg_base_quality_read(&q);
+        // sum=55, avg=5 (integer division), scaled to 0..254 against
+        // MAX_AVG_BASE_QUALITY=93: 254 * 5 / 93 = 13.65 → 13.
+        let expected = scale_color(5, MAX_AVG_BASE_QUALITY);
+        assert_eq!(v, expected);
+    }
+
     #[test]
     fn blank_is_zero() {
         assert_eq!(blank_read(), 0);
@@ -717,6 +763,27 @@ mod tests {
         assert_eq!(homopolymer_weights(b"ATAT"), vec![1, 1, 1, 1]);
     }
 
+    /// Mirrors upstream `HomoPolymerWeightedTest::BasicCase`.
+    #[test]
+    fn homopolymer_weights_upstream_basic_case() {
+        // "GATTGGGCCCCAAAAA" → runs of 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5
+        let expected: Vec<u8> = vec![1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5];
+        assert_eq!(homopolymer_weights(b"GATTGGGCCCCAAAAA"), expected);
+    }
+
+    /// Mirrors upstream `HomoPolymerWeightedTest::WeightedHomoPolymerMax`.
+    /// Run length cap is 255 (u8::MAX); we use a 30bp run to confirm
+    /// no overflow at our smaller `MAX_HOMOPOLYMER_WEIGHTED=30` cap.
+    #[test]
+    fn homopolymer_weights_long_run() {
+        let s: Vec<u8> = (0..30).map(|_| b'A').collect();
+        let weights = homopolymer_weights(&s);
+        assert_eq!(weights.len(), 30);
+        assert!(weights.iter().all(|&w| w == 30));
+        // Pixel scale: 30/30 → 254.
+        assert_eq!(homopolymer_weighted_read_at(&s, 15), 254);
+    }
+
     #[test]
     fn homopolymer_weighted_pixel() {
         let seq = b"ATCGGGAA";
@@ -731,11 +798,56 @@ mod tests {
 
     #[test]
     fn is_homopolymer_pixel() {
+        // ATCGGGAA: only the GGG run (offsets 3,4,5) qualifies.
+        // Run length 2 ("AA" at the end) does NOT qualify per upstream
+        // (threshold is 3-or-more).
         let seq = b"ATCGGGAA";
         assert_eq!(is_homopolymer_read_at(seq, 0), 0);
         assert_eq!(is_homopolymer_read_at(seq, 1), 0);
         assert_eq!(is_homopolymer_read_at(seq, 3), 254);
-        assert_eq!(is_homopolymer_read_at(seq, 6), 254);
+        assert_eq!(is_homopolymer_read_at(seq, 4), 254);
+        assert_eq!(is_homopolymer_read_at(seq, 5), 254);
+        assert_eq!(is_homopolymer_read_at(seq, 6), 0); // "AA" run len 2
+        assert_eq!(is_homopolymer_read_at(seq, 7), 0);
+    }
+
+    /// Mirrors upstream `IsHomoPolymerTest::IsHomopolymerBeginning`.
+    #[test]
+    fn is_homopolymer_beginning() {
+        let seq = b"GGGATAATA";
+        let expected = [254, 254, 254, 0, 0, 0, 0, 0, 0];
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(is_homopolymer_read_at(seq, i), want, "offset {i}");
+        }
+    }
+
+    /// Mirrors upstream `IsHomoPolymerTest::IsHomopolymerMiddle`.
+    #[test]
+    fn is_homopolymer_middle() {
+        let seq = b"ATTGGGTTA";
+        let expected = [0, 0, 0, 254, 254, 254, 0, 0, 0];
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(is_homopolymer_read_at(seq, i), want, "offset {i}");
+        }
+    }
+
+    /// Mirrors upstream `IsHomoPolymerTest::IsHomopolymerEnd`.
+    #[test]
+    fn is_homopolymer_end() {
+        let seq = b"ATAATAGGG";
+        let expected = [0, 0, 0, 0, 0, 0, 254, 254, 254];
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(is_homopolymer_read_at(seq, i), want, "offset {i}");
+        }
+    }
+
+    /// Mirrors upstream `IsHomoPolymerTest::IsHomopolymerAll`.
+    #[test]
+    fn is_homopolymer_all_one_run() {
+        let seq = b"AAAAAAAAA";
+        for i in 0..seq.len() {
+            assert_eq!(is_homopolymer_read_at(seq, i), 254);
+        }
     }
 
     #[test]
