@@ -6,6 +6,7 @@ pub mod direct_phasing;
 pub mod gvcf;
 pub mod make_examples;
 pub mod math;
+pub mod methylation_aware_phasing;
 pub mod nucleus;
 pub mod pileup_image;
 pub mod postprocess;
