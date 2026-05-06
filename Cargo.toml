@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 prost = "0.13"
 prost-build = "0.13"
-noodles = { version = "0.92", features = ["bam", "sam", "vcf", "fasta", "bgzf", "csi", "tabix", "core"] }
+noodles = { version = "0.92", features = ["bam", "cram", "sam", "vcf", "fasta", "bgzf", "csi", "tabix", "core"] }
 crc32c = "0.6"
 flate2 = "1"
 rand = { version = "0.8", default-features = false }

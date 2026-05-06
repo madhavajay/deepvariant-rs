@@ -243,27 +243,39 @@ fn make_examples_cmd(
     }
 
 
-    let (_h, mut reader) = dv_io::bam::open(reads_path).context("open BAM")?;
+    // Format-agnostic reader: BAM by default, CRAM when the path
+    // ends in `.cram`. CRAM is reference-compressed so we pass the
+    // FASTA path through.
+    let (_h, mut reader) =
+        dv_io::reads::open(reads_path, Some(ref_path)).context("open alignment input")?;
     let mut owned: Vec<OwnedRead> = Vec::new();
-    for rec in reader.records() {
-        let r = rec?;
-        let Some(start) = r.alignment_start() else { continue };
+    reader.for_each_record(&_h, |r| {
+        let Some(start) = r.alignment_start() else { return Ok(()) };
         let start_0based = usize::from(start.unwrap()) as i64 - 1;
         // Filter reads matching upstream's read_requirements default:
         // skip secondary/supplementary, unmapped, duplicates, QC-fail, and
-        // low mapping quality (< 10).
-        let flags = r.flags();
+        // low mapping quality (< 10). The `Record` trait returns
+        // Result for fallible accessors; a parse error reading any
+        // field means we should skip the record rather than crash.
+        let flags = match r.flags() {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        };
         if flags.is_secondary()
             || flags.is_supplementary()
             || flags.is_unmapped()
             || flags.is_duplicate()
             || flags.is_qc_fail()
         {
-            continue;
+            return Ok(());
         }
-        let mq_check = r.mapping_quality().map(|q| q.get()).unwrap_or(255);
+        let mq_check = r
+            .mapping_quality()
+            .and_then(|q| q.ok())
+            .map(|q| q.get())
+            .unwrap_or(255);
         if mq_check < 10 {
-            continue;
+            return Ok(());
         }
         let cigar_owned: Vec<(char, i64)> = r
             .cigar()
@@ -279,18 +291,18 @@ fn make_examples_cmd(
             .map(|(_, l)| *l)
             .sum();
         if start_0based + read_len_on_ref < region.start || start_0based >= region.end {
-            continue;
+            return Ok(());
         }
         let seq: Vec<u8> = r.sequence().iter().map(|b| b.to_ascii_uppercase()).collect();
         let bq: Vec<u8> = r.quality_scores().iter().map(|q| q.unwrap_or(0)).collect();
-        let mq = r.mapping_quality().map(|q| q.get()).unwrap_or(255);
-        let is_rev = r.flags().is_reverse_complemented();
-        let frag = r.template_length() as i32;
+        let mq = mq_check;
+        let is_rev = flags.is_reverse_complemented();
+        let frag = r.template_length().unwrap_or(0) as i32;
         let name = r
             .name()
             .map(|n| std::str::from_utf8(n.as_ref()).unwrap_or("").to_string())
             .unwrap_or_default();
-        let mate = if r.flags().is_first_segment() { 1 } else { 2 };
+        let mate = if flags.is_first_segment() { 1 } else { 2 };
         // HP aux tag: 1 → haplotype 1, 2 → haplotype 2, anything else → 0.
         let hp_tag = {
             use noodles::sam::alignment::record::data::field::Tag;
@@ -317,7 +329,8 @@ fn make_examples_cmd(
             mate,
             hp: hp_tag,
         });
-    }
+        Ok(())
+    })?;
     tracing::info!(reads_loaded = owned.len(), "loaded reads");
 
     // Run allele counter.
