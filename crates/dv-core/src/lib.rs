@@ -1,6 +1,7 @@
 //! Genomics compute. Modules added per port milestone.
 
 pub mod allelecounter;
+pub mod alt_aligned_pileup;
 pub mod direct_phasing;
 pub mod gvcf;
 pub mod make_examples;
