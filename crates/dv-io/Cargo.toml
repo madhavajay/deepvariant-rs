@@ -8,7 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
-noodles.workspace = true
+# Enable cram here (not in the workspace dep) so the bzip2/xz C deps
+# only land when dv-io is in the build graph. Pure-compute crates
+# that depend on the workspace `noodles` directly skip these.
+noodles = { workspace = true, features = ["cram"] }
 crc32c.workspace = true
 flate2.workspace = true
 prost.workspace = true

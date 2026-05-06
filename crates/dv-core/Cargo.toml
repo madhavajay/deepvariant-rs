@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Default = full feature set (all IO / file-format modules enabled).
+# `wasm` excludes everything that drags in C-only deps (noodles-cram's
+# bzip2 / xz, dv-io's flate2/bgzf chain) so the pure-compute modules
+# can build for wasm32-unknown-unknown.
+default = ["io"]
+io = ["dep:dv-io", "dep:noodles"]
+
 [dev-dependencies]
 flate2.workspace = true
 noodles.workspace = true
@@ -13,8 +21,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 dv-proto = { path = "../dv-proto" }
-dv-io = { path = "../dv-io" }
+dv-io = { path = "../dv-io", optional = true }
 prost.workspace = true
-noodles.workspace = true
+noodles = { workspace = true, optional = true }
 rand.workspace = true
 rand_mt.workspace = true
