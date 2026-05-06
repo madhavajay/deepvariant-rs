@@ -8,6 +8,7 @@ pub mod make_examples;
 pub mod math;
 pub mod methylation_aware_phasing;
 pub mod nucleus;
+pub mod phasing_apply;
 pub mod pileup_image;
 pub mod postprocess;
 pub mod realigner;
