@@ -265,6 +265,230 @@ pub fn total_count(c: &AlleleCount) -> i32 {
     c.ref_supporting_read_count + c.ref_nonconfident_read_count + c.read_alleles.len() as i32
 }
 
+/// Sum of read counts grouped by (allele_type, bases) — analog of
+/// upstream `SumAlleleCounts` (single AlleleCount). Optionally
+/// excludes low-quality alleles. Mirrors upstream's REF-injection
+/// behavior: when ref_supporting_read_count > 0 and `track_ref_reads`
+/// is false, a synthetic REFERENCE allele is appended with that count.
+pub fn sum_allele_counts(count: &AlleleCount, include_low_quality: bool) -> Vec<Allele> {
+    use std::collections::BTreeMap;
+    let mut sums: BTreeMap<(i32, String), i32> = BTreeMap::new();
+    for allele in count.read_alleles.values() {
+        if !include_low_quality && allele.is_low_quality {
+            continue;
+        }
+        *sums
+            .entry((allele.r#type, allele.bases.clone()))
+            .or_insert(0) += 1;
+    }
+    let mut out: Vec<Allele> = sums
+        .into_iter()
+        .map(|((t, bases), c)| Allele {
+            bases,
+            r#type: t,
+            count: c,
+            ..Default::default()
+        })
+        .collect();
+    if count.ref_supporting_read_count > 0 && !count.track_ref_reads {
+        out.push(Allele {
+            bases: count.ref_base.clone(),
+            r#type: AlleleType::Reference as i32,
+            count: count.ref_supporting_read_count,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Span variant of `sum_allele_counts` — sums across multiple
+/// AlleleCount slots (e.g. when a candidate spans more than one ref
+/// base). Mirrors upstream's `SumAlleleCounts(span<AlleleCount>)`.
+pub fn sum_allele_counts_span(counts: &[AlleleCount], include_low_quality: bool) -> Vec<Allele> {
+    use std::collections::BTreeMap;
+    let mut sums: BTreeMap<(i32, String), i32> = BTreeMap::new();
+    for ac in counts {
+        for allele in ac.read_alleles.values() {
+            if !include_low_quality && allele.is_low_quality {
+                continue;
+            }
+            *sums
+                .entry((allele.r#type, allele.bases.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<Allele> = sums
+        .into_iter()
+        .map(|((t, bases), c)| Allele {
+            bases,
+            r#type: t,
+            count: c,
+            ..Default::default()
+        })
+        .collect();
+    let total_ref: i32 = counts.iter().map(|c| c.ref_supporting_read_count).sum();
+    if total_ref > 0
+        && !counts.is_empty()
+        && !counts[0].track_ref_reads
+    {
+        out.push(Allele {
+            bases: counts[0].ref_base.clone(),
+            r#type: AlleleType::Reference as i32,
+            count: total_ref,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Total number of reads at a single position counting both ref and
+/// non-ref support. Excludes REFERENCE-typed alleles in `read_alleles`
+/// (which can appear when `track_ref_reads` is set) to avoid double
+/// counting them with `ref_supporting_read_count`. Mirrors upstream
+/// `TotalAlleleCounts`.
+pub fn total_allele_counts(count: &AlleleCount, include_low_quality: bool) -> i32 {
+    let mut total = count
+        .read_alleles
+        .values()
+        .filter(|a| {
+            (!a.is_low_quality || include_low_quality) && a.r#type != AlleleType::Reference as i32
+        })
+        .count() as i32;
+    total += count.ref_supporting_read_count;
+    total
+}
+
+/// Span variant of `total_allele_counts`.
+pub fn total_allele_counts_span(counts: &[AlleleCount], include_low_quality: bool) -> i32 {
+    counts
+        .iter()
+        .map(|c| total_allele_counts(c, include_low_quality))
+        .sum()
+}
+
+/// True iff every base in `seq[offset..offset+len]` is one of the
+/// canonical bases A/C/G/T/N. Mirrors upstream
+/// `nucleus::IsCanonicalBase` applied to the slice. Note: upstream's
+/// canonical set includes N — non-canonical bases are e.g. R/Y/W/S
+/// (IUPAC ambiguity codes that are rare in modern reads).
+fn is_canonical_slice(seq: &[u8], offset: usize, len: usize) -> bool {
+    seq[offset..offset + len]
+        .iter()
+        .all(|&b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'N' | b'a' | b'c' | b'g' | b't' | b'n'))
+}
+
+/// Decide whether the bases at `[offset, offset+len)` of `read` can
+/// contribute to allele counting. Returns
+/// `(usable, is_low_quality)`. Mirrors upstream `CanBasesBeUsed`:
+///   * Any non-canonical base (e.g. IUPAC ambiguity) → unusable.
+///   * `keep_legacy_behavior=true` AND any per-base BQ below threshold
+///     → unusable (matches the v1 behavior).
+///   * `keep_legacy_behavior=false` AND average BQ across the span
+///     below threshold → usable but flagged low-quality.
+pub fn can_bases_be_used(
+    seq: &[u8],
+    quality: &[u8],
+    offset: usize,
+    len: usize,
+    min_base_quality: u8,
+    keep_legacy_behavior: bool,
+) -> (bool, bool) {
+    if offset + len > seq.len() || offset + len > quality.len() {
+        return (false, false);
+    }
+    let mut indel_bq: u32 = 0;
+    for i in 0..len {
+        indel_bq += quality[offset + i] as u32;
+        if quality[offset + i] < min_base_quality && keep_legacy_behavior {
+            return (false, false);
+        }
+    }
+    if !is_canonical_slice(seq, offset, len) {
+        return (false, false);
+    }
+    let mut is_low_quality = false;
+    if !keep_legacy_behavior {
+        if (indel_bq as i64) < (min_base_quality as i64) * (len as i64) {
+            is_low_quality = true;
+        }
+    }
+    (true, is_low_quality)
+}
+
+/// Average base quality across the span. For DEL operations there's
+/// no in-read coverage to average, so upstream returns the BQ of the
+/// base immediately before the deletion (or 0 at offset 0). Mirrors
+/// upstream `GetAvgBaseQuality`.
+pub fn get_avg_base_quality(
+    quality: &[u8],
+    cigar_op: char,
+    offset: usize,
+    len: usize,
+) -> i32 {
+    if cigar_op == 'D' {
+        let idx = offset.saturating_sub(1);
+        return quality.get(idx).copied().unwrap_or(0) as i32;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let sum: u32 = (0..len)
+        .filter_map(|i| quality.get(offset + i).copied())
+        .map(|q| q as u32)
+        .sum();
+    (sum / len.max(1) as u32) as i32
+}
+
+/// Locate the AlleleCount at `pos` in a sorted slice via binary
+/// search. Returns `Some(index)` on hit, `None` otherwise. Mirrors
+/// upstream `AlleleIndex`.
+pub fn allele_index(counts: &[AlleleCount], pos: i64) -> Option<usize> {
+    let idx = counts.partition_point(|c| {
+        c.position
+            .as_ref()
+            .map(|p| p.position < pos)
+            .unwrap_or(false)
+    });
+    if idx >= counts.len() {
+        return None;
+    }
+    let p = counts[idx].position.as_ref().map(|p| p.position).unwrap_or(-1);
+    if p == pos {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Convert a 5mC modification byte (0..=255) to a probability in
+/// [0.0, 1.0]. The encoding matches `BaseModifications` in the BAM
+/// MM/ML tag spec — a value of 0 indicates either no modification
+/// data or a strong unmodified call.
+#[inline]
+pub fn methylation_probability(level: u8) -> f64 {
+    level as f64 / 255.0
+}
+
+/// Decide whether a given base position is "called methylated" given
+/// the per-base 5mC level. Mirrors upstream `IsMethylated`. When
+/// methylation calling is disabled or no MM/ML data is available, the
+/// answer is always false.
+pub fn is_methylated(
+    level_at_offset: Option<u8>,
+    enable_methylation_calling: bool,
+    threshold: f64,
+) -> bool {
+    if !enable_methylation_calling {
+        return false;
+    }
+    let lvl = match level_at_offset {
+        Some(0) => return false,
+        Some(l) => l,
+        None => return false,
+    };
+    methylation_probability(lvl) > threshold
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +647,185 @@ mod tests {
             assert_eq!(c.ref_supporting_read_count, 0);
             assert_eq!(c.ref_nonconfident_read_count, 1);
         }
+    }
+
+    /// Build a synthetic AlleleCount populated with N reads supporting
+    /// each of `alts`, plus `ref_count` REF reads. Helper for the
+    /// summary helpers below.
+    fn synth_count(
+        ref_base: &str,
+        ref_count: i32,
+        alts: &[(&str, i32, AlleleType, bool)], // (bases, count, type, is_low_quality)
+    ) -> AlleleCount {
+        let mut c = AlleleCount {
+            position: Some(Position {
+                reference_name: "chr1".into(),
+                position: 100,
+                reverse_strand: false,
+            }),
+            ref_base: ref_base.into(),
+            ref_supporting_read_count: ref_count,
+            ..Default::default()
+        };
+        let mut rid = 0usize;
+        for (bases, n, t, lq) in alts {
+            for _ in 0..*n {
+                c.read_alleles.insert(
+                    format!("read{}/1", rid),
+                    Allele {
+                        bases: (*bases).into(),
+                        r#type: *t as i32,
+                        count: 1,
+                        is_low_quality: *lq,
+                        ..Default::default()
+                    },
+                );
+                rid += 1;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn sum_allele_counts_groups_by_type_and_bases() {
+        let c = synth_count(
+            "A",
+            5,
+            &[
+                ("C", 3, AlleleType::Substitution, false),
+                ("C", 1, AlleleType::Substitution, true),
+                ("G", 2, AlleleType::Substitution, false),
+            ],
+        );
+        let with_lq = sum_allele_counts(&c, true);
+        // 3 unique alts (C non-lq + C lq aggregated, G) + REF synth = 3+REF
+        // Actually: ("C", SUB) appears 4 times (3 + 1). G 2 times. REF 5.
+        let total: i32 = with_lq.iter().map(|a| a.count).sum();
+        assert_eq!(total, 4 + 2 + 5);
+
+        let no_lq = sum_allele_counts(&c, false);
+        // dropping the LQ "C" leaves 3 C + 2 G + 5 REF.
+        let total: i32 = no_lq.iter().map(|a| a.count).sum();
+        assert_eq!(total, 3 + 2 + 5);
+    }
+
+    #[test]
+    fn sum_allele_counts_span_aggregates_across_positions() {
+        let mut c1 = synth_count(
+            "A",
+            5,
+            &[("C", 2, AlleleType::Substitution, false)],
+        );
+        let c2 = synth_count(
+            "A",
+            3,
+            &[("C", 1, AlleleType::Substitution, false)],
+        );
+        // ensure positions differ
+        c1.position.as_mut().unwrap().position = 100;
+        let mut c2 = c2;
+        c2.position.as_mut().unwrap().position = 101;
+        let res = sum_allele_counts_span(&[c1, c2], true);
+        // C is summed = 3, REF = 5+3 = 8
+        let c_count: i32 = res.iter().filter(|a| a.bases == "C").map(|a| a.count).sum();
+        let ref_count: i32 = res
+            .iter()
+            .filter(|a| a.r#type == AlleleType::Reference as i32)
+            .map(|a| a.count)
+            .sum();
+        assert_eq!(c_count, 3);
+        assert_eq!(ref_count, 8);
+    }
+
+    #[test]
+    fn total_allele_counts_excludes_ref_typed_alts() {
+        // track_ref_reads off → REFERENCE in read_alleles is unusual,
+        // but the total should still include alt+ref_supporting only.
+        let c = synth_count(
+            "A",
+            4,
+            &[
+                ("C", 2, AlleleType::Substitution, false),
+                ("CC", 1, AlleleType::Insertion, false),
+                // a REFERENCE-typed entry (synthetic; should be skipped):
+                ("A", 3, AlleleType::Reference, false),
+            ],
+        );
+        // Expected: 2 (C SUB) + 1 (CC INS) + 4 (ref_supporting) = 7
+        assert_eq!(total_allele_counts(&c, true), 7);
+    }
+
+    #[test]
+    fn total_allele_counts_lq_filter() {
+        let c = synth_count(
+            "A",
+            0,
+            &[
+                ("C", 3, AlleleType::Substitution, true),
+                ("G", 2, AlleleType::Substitution, false),
+            ],
+        );
+        assert_eq!(total_allele_counts(&c, true), 5);
+        assert_eq!(total_allele_counts(&c, false), 2); // drops LQ
+    }
+
+    #[test]
+    fn can_bases_be_used_canonical_and_quality_logic() {
+        let seq = b"ACGTNX"; // X is non-canonical
+        let q = vec![30u8, 30, 30, 30, 30, 30];
+        // All canonical, BQ 30, threshold 20 → usable, not low-quality.
+        let (ok, lq) = can_bases_be_used(seq, &q, 0, 5, 20, false);
+        assert!(ok && !lq);
+        // Hits non-canonical X at offset 5.
+        let (ok, _) = can_bases_be_used(seq, &q, 5, 1, 20, false);
+        assert!(!ok);
+        // Legacy mode: any low-BQ kills it.
+        let q2 = vec![10u8, 30, 30, 30, 30, 30];
+        let (ok, _) = can_bases_be_used(seq, &q2, 0, 4, 20, true);
+        assert!(!ok);
+        // Modern mode: averaged below threshold → flagged but usable.
+        let q3 = vec![5u8, 5, 5, 30, 30, 30];
+        let (ok, lq) = can_bases_be_used(seq, &q3, 0, 4, 20, false);
+        assert!(ok && lq);
+        // Out of bounds → not usable.
+        let (ok, _) = can_bases_be_used(seq, &q, 0, 100, 20, false);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn get_avg_base_quality_match_and_del() {
+        let q = vec![30u8, 40, 50, 60];
+        // Match: 4-base average of 30/40/50/60 = 45.
+        assert_eq!(get_avg_base_quality(&q, 'M', 0, 4), 45);
+        // Insertion 2 bases at offset 1: (40+50)/2 = 45.
+        assert_eq!(get_avg_base_quality(&q, 'I', 1, 2), 45);
+        // Deletion at offset 2 → BQ at offset 1 = 40.
+        assert_eq!(get_avg_base_quality(&q, 'D', 2, 3), 40);
+        // Deletion at offset 0 → BQ at offset 0 = 30.
+        assert_eq!(get_avg_base_quality(&q, 'D', 0, 3), 30);
+    }
+
+    #[test]
+    fn allele_index_binary_search() {
+        let counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
+        assert_eq!(allele_index(&counts, 100), Some(0));
+        assert_eq!(allele_index(&counts, 109), Some(9));
+        assert_eq!(allele_index(&counts, 105), Some(5));
+        assert_eq!(allele_index(&counts, 110), None);
+        assert_eq!(allele_index(&counts, 99), None);
+    }
+
+    #[test]
+    fn methylation_helpers() {
+        assert!((methylation_probability(128) - 128.0 / 255.0).abs() < 1e-6);
+        // Disabled → always false.
+        assert!(!is_methylated(Some(128), false, 0.5));
+        // 128/255 ≈ 0.5019 > 0.5 → true.
+        assert!(is_methylated(Some(128), true, 0.5));
+        // Above 0.51 → false.
+        assert!(!is_methylated(Some(128), true, 0.51));
+        // Level==0 is treated as no data.
+        assert!(!is_methylated(Some(0), true, 0.0));
+        assert!(!is_methylated(None, true, 0.0));
     }
 }
