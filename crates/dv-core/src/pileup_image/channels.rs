@@ -647,6 +647,51 @@ mod tests {
         assert_eq!(identity_read(vec![], 0), 0);
     }
 
+    /// Mirrors upstream `IdentityTest::PacBioStyleCigar`:
+    /// `"5=", "1X", "4="` → identity = 90% → scale_color(90, 100).
+    #[test]
+    fn identity_pacbio_style_cigar() {
+        let cigar = vec![('=', 5), ('X', 1), ('=', 4)];
+        assert_eq!(identity_read(cigar, 10), scale_color(90, 100));
+    }
+
+    /// Mirrors upstream `GapCompressedIdentityTest::DeletionCase`:
+    /// `"3M", "4D", "3M"` → matches=6, indel runs=1 → 6/7 ≈ 85.7%.
+    #[test]
+    fn gap_compressed_identity_deletion_case() {
+        let cigar = vec![('M', 3), ('D', 4), ('M', 3)];
+        let v = gap_compressed_identity_read(cigar);
+        // 6 / (6 + 0 + 1) = 6/7 ≈ 85.71%; scaled: 254 * 6/7 ≈ 217.7 → 217.
+        assert!((215..=220).contains(&v), "got {v}");
+    }
+
+    /// Mirrors upstream `GapCompressedIdentityTest::PacBioStyleCigar`:
+    /// `"3=", "2X", "2I", "3="` → matches=6, mismatches=2, indel runs=1
+    /// → 6/9 ≈ 67%.
+    #[test]
+    fn gap_compressed_identity_pacbio_style_cigar() {
+        let cigar = vec![('=', 3), ('X', 2), ('I', 2), ('=', 3)];
+        let v = gap_compressed_identity_read(cigar);
+        let expected = scale_color(66, 100); // (6*100)/9 = 66.66 → trunc 66
+        // upstream's int division yields 66, not 67.
+        assert!(
+            (v as i32 - expected as i32).abs() <= 2,
+            "got {v} expected near {expected}"
+        );
+    }
+
+    /// Mirrors upstream `AvgBaseQualityTest::BasicCase`. Read of 10
+    /// bases with quality 1..=10 → mean = 55/10 = 5 → scaled.
+    #[test]
+    fn avg_base_quality_upstream_basic_case() {
+        let q: Vec<u8> = (1..=10u8).collect();
+        let v = avg_base_quality_read(&q);
+        // sum=55, avg=5 (integer division), scaled to 0..254 against
+        // MAX_AVG_BASE_QUALITY=93: 254 * 5 / 93 = 13.65 → 13.
+        let expected = scale_color(5, MAX_AVG_BASE_QUALITY);
+        assert_eq!(v, expected);
+    }
+
     #[test]
     fn blank_is_zero() {
         assert_eq!(blank_read(), 0);
