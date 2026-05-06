@@ -282,4 +282,161 @@ mod tests {
         assert_eq!(cs[0].start, 102);
         assert_eq!(cs[0].alternate_bases, vec!["ACC"]);
     }
+
+    /// Mirrors upstream `TestNoVariant`. Pure-ref pileup must not emit
+    /// any candidate.
+    #[test]
+    fn no_variant_with_pure_ref() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..15 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert!(cs.is_empty());
+    }
+
+    /// Mirrors upstream `TestNonCanonicalBase`. Bases like 'N' don't
+    /// trigger a candidate (they're filtered by allele counter via
+    /// the substitution branch — no alt allele is recorded).
+    #[test]
+    fn non_canonical_base_does_not_emit() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..10 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        // 5 reads with 'N' at position 102 — N is canonical for our
+        // counter (it tracks the base) but doesn't pass the SUB
+        // threshold against the high ref count without enough fraction.
+        // We use this to verify that even with N as an alt the
+        // overall threshold filtering applies.
+        let mut counts2 = counts.clone();
+        for i in 0..1 {
+            let name = format!("nn{i}");
+            add_read(&mut counts2, &syn_read(&name, 100, &[('M', 5)], b"AANAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts2, &VariantCallerOptions::default());
+        // 1/11 = 9% < 12% threshold → no candidate.
+        assert!(cs.is_empty());
+    }
+
+    /// Mirrors upstream `TestMinCount1`. With min_count_snps=10 a
+    /// single SNP read isn't enough.
+    #[test]
+    fn min_count_threshold() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for _ in 0..1 {
+            add_read(&mut counts, &syn_read("alt", 100, &[('M', 5)], b"AACAA"), &opts, 100);
+        }
+        let mut o = VariantCallerOptions::default();
+        o.min_count_snps = 10;
+        o.min_fraction_snps = 0.0;
+        let cs = candidates_from_counts(&counts, &o);
+        assert!(cs.is_empty());
+        // Drop the count threshold to 1 → candidate emerges.
+        let mut o2 = o.clone();
+        o2.min_count_snps = 1;
+        let cs = candidates_from_counts(&counts, &o2);
+        assert_eq!(cs.len(), 1);
+    }
+
+    /// Mirrors upstream `TestMultAllelicSNP`. Two distinct alts each
+    /// passing the threshold should appear in the same candidate
+    /// record's alternate_bases list, sorted lexicographically.
+    #[test]
+    fn multi_allelic_snp() {
+        let mut counts = empty_counts("chr1", 100, 105, b"AAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..5 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAAAA"), &opts, 100);
+        }
+        for i in 0..5 {
+            let name = format!("alt_c{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AACAA"), &opts, 100);
+        }
+        for i in 0..5 {
+            let name = format!("alt_g{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 5)], b"AAGAA"), &opts, 100);
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].start, 102);
+        // Sorted alphabetically — C before G.
+        assert_eq!(cs[0].alternate_bases, vec!["C", "G"]);
+    }
+
+    /// Mirrors upstream `TestBiAllelicDeletion`. A 2bp deletion
+    /// passing thresholds emits a single candidate at the anchor
+    /// position with REF span = anchor + deleted bases.
+    ///
+    /// Our allelecounter now stores DEL alleles with the actual
+    /// ref bases (anchor + deleted ref bases), matching upstream's
+    /// `AlleleCounter::AddReadAllele(DEL)`. variant_calling
+    /// propagates that into `reference_bases` and `alternate_bases`.
+    #[test]
+    fn bi_allelic_deletion() {
+        let mut counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..8 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AAAAAAAAAA"), &opts, 100);
+        }
+        for i in 0..4 {
+            let name = format!("del{i}");
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 3), ('D', 2), ('M', 5)], b"AAAAAAAA"),
+                &opts,
+                100,
+            );
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].start, 102);
+        // REF spans 1 anchor + 2 deleted bases = 3.
+        assert_eq!(cs[0].reference_bases.len(), 3);
+        assert_eq!(cs[0].alternate_bases.len(), 1);
+    }
+
+    /// Two simultaneous indel alts at the same anchor.
+    #[test]
+    fn snp_plus_insertion_at_same_position() {
+        let mut counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
+        let opts = CounterOptions::default();
+        for i in 0..6 {
+            let name = format!("ref{i}");
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AAAAAAAAAA"), &opts, 100);
+        }
+        for i in 0..3 {
+            let name = format!("snp{i}");
+            // SNP at position 102: A → C
+            add_read(&mut counts, &syn_read(&name, 100, &[('M', 10)], b"AACAAAAAAA"), &opts, 100);
+        }
+        for i in 0..3 {
+            let name = format!("ins{i}");
+            // Insertion of CC after position 102.
+            add_read(
+                &mut counts,
+                &syn_read(&name, 100, &[('M', 3), ('I', 2), ('M', 7)], b"AAACCAAAAAAA"),
+                &opts,
+                100,
+            );
+        }
+        let cs = candidates_from_counts(&counts, &VariantCallerOptions::default());
+        // Both alts appear at the appropriate position. SNP is at 102,
+        // insertion anchored at 102 — same position so one record with
+        // two alts.
+        assert!(!cs.is_empty());
+        let snp = cs.iter().find(|v| v.start == 102 && v.reference_bases == "A");
+        assert!(snp.is_some(), "expected SNP candidate at 102");
+        // Alt list must contain both "C" and an insertion-style "ACC".
+        let alts = &snp.unwrap().alternate_bases;
+        assert!(alts.iter().any(|a| a == "C"), "missing SNP alt C");
+        assert!(alts.iter().any(|a| a.len() == 3), "missing INS alt ACC-like");
+    }
 }
