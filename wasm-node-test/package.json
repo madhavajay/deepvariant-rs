@@ -1,0 +1,13 @@
+{
+  "name": "dv-wasm-node-test",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end ORT-through-wasm test harness (Node + onnxruntime-node).",
+  "scripts": {
+    "test": "node --no-warnings test.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.24.0"
+  }
+}
