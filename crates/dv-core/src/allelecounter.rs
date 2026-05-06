@@ -165,25 +165,36 @@ pub fn add_read(counts: &mut [AlleleCount], read: &AlignedRead, opts: &CounterOp
                 read_pos += len_usize;
             }
             'D' => {
-                // Deletion keyed to the previous ref position; bases =
-                // ref_base + deleted ref bases.
+                // Deletion keyed to the previous ref position. Bases =
+                // anchor ref base + the deleted ref bases (matching
+                // upstream's `AlleleCounter::AddReadAllele(DEL)` which
+                // splices in the actual reference). When the deleted
+                // span runs off the end of the AlleleCount slice
+                // (e.g. read trails past the region) the missing
+                // positions fall back to 'N' so the bases length still
+                // reflects the deletion size.
                 let anchor_ref = ref_pos - 1;
                 let pos_idx = anchor_ref - region_start;
                 if pos_idx >= 0 && pos_idx < counts.len() as i64 {
-                    let count = &mut counts[pos_idx as usize];
-                    let ref_b = count.ref_base.as_bytes()[0].to_ascii_uppercase();
-                    // We don't have direct access to the deleted ref bases here
-                    // (would need ref_bases buffer); store anchor only and set
-                    // bases length via deletion length signal.
+                    let ref_b = counts[pos_idx as usize]
+                        .ref_base
+                        .as_bytes()[0]
+                        .to_ascii_uppercase();
                     let mut bases = String::with_capacity(len_usize + 1);
                     bases.push(ref_b as char);
-                    // Insert deleted-base sentinel marker: upstream stores the
-                    // actual ref bases here, but for tally purposes the length
-                    // suffices. We mark them with 'N' so callers can identify
-                    // the deletion length without a ref lookup.
-                    for _ in 0..len_usize {
-                        bases.push('N');
+                    for k in 0..len_usize {
+                        let del_idx = pos_idx + 1 + k as i64;
+                        if del_idx >= 0 && (del_idx as usize) < counts.len() {
+                            let del_b = counts[del_idx as usize]
+                                .ref_base
+                                .as_bytes()[0]
+                                .to_ascii_uppercase();
+                            bases.push(del_b as char);
+                        } else {
+                            bases.push('N');
+                        }
                     }
+                    let count = &mut counts[pos_idx as usize];
                     count.read_alleles.insert(
                         read_id.clone(),
                         Allele {
@@ -571,6 +582,47 @@ mod tests {
         for i in 3..6 {
             assert_eq!(counts[i].ref_supporting_read_count, 1);
         }
+    }
+
+    /// Mirrors upstream `TestDeletionSize2`. Verifies the DEL allele's
+    /// `bases` field stores actual reference bases (anchor + deleted
+    /// bases) rather than 'N' filler.
+    #[test]
+    fn deletion_size_2_uses_actual_ref_bases() {
+        // Ref bases TGCCT — 5 bases.
+        // Read: 1M 2D 2M = match T, delete CC, match GT.
+        let ref_bases = b"TGCCT";
+        let mut counts = empty_counts("chr1", 100, 105, ref_bases);
+        // Reset bases to actual ref bases (test ref only had T's
+        // earlier; here we pass the real sequence).
+        for (i, c) in counts.iter_mut().enumerate() {
+            c.ref_base = (ref_bases[i] as char).to_string();
+        }
+        let opts = CounterOptions::default();
+        // Read: ref starts at 100, 1M then 2D then 2M.
+        // Read seq is "TGT" (matches positions 0, 3, 4 of ref).
+        // But upstream's MakeRead expects the read seq to match the
+        // pre-deletion bases — we use "TGT" same as upstream test.
+        let read = AlignedRead {
+            name: "r1",
+            mate_number: 1,
+            ref_start: 100,
+            cigar: &[('M', 1), ('D', 2), ('M', 2)],
+            seq: b"TGT",
+            base_quality: &[40u8; 3],
+            mapping_quality: 60,
+            is_reverse_strand: false,
+        };
+        add_read(&mut counts, &read, &opts, 100);
+
+        // Position 0 is the anchor — should have a DEL allele.
+        let alleles = &counts[0].read_alleles;
+        assert_eq!(alleles.len(), 1);
+        let a = alleles.values().next().unwrap();
+        assert_eq!(a.r#type, AlleleType::Deletion as i32);
+        // Bases = anchor "T" + deleted "GC" = "TGC" — actual ref bases,
+        // NOT "TNN".
+        assert_eq!(a.bases, "TGC");
     }
 
     #[test]

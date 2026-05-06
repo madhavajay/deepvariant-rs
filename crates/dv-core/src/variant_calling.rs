@@ -374,14 +374,10 @@ mod tests {
     /// passing thresholds emits a single candidate at the anchor
     /// position with REF span = anchor + deleted bases.
     ///
-    /// NOTE: Our allelecounter stores deletion alleles as
-    /// `anchor + 'N' * deleted_length` in `bases` (since it lacks a
-    /// FASTA reader), and variant_calling propagates that into both
-    /// `reference_bases` and `alternate_bases`. The downstream
-    /// pileup builder reads the true REF from FASTA, so this is
-    /// fine for make_examples; postprocess writes the canonical
-    /// VCF REF/ALT shape after re-keying. The test checks the
-    /// position and that we got exactly one alt.
+    /// Our allelecounter now stores DEL alleles with the actual
+    /// ref bases (anchor + deleted ref bases), matching upstream's
+    /// `AlleleCounter::AddReadAllele(DEL)`. variant_calling
+    /// propagates that into `reference_bases` and `alternate_bases`.
     #[test]
     fn bi_allelic_deletion() {
         let mut counts = empty_counts("chr1", 100, 110, b"AAAAAAAAAA");
