@@ -113,7 +113,6 @@ pub fn trim_cigar(cigar: &[(char, i64)], ref_start: i64, ref_length: i64) -> Tri
                 if advances_read {
                     new_read_length += c_len;
                 }
-                ref_to_cover_remaining = 0;
                 break;
             }
         }
