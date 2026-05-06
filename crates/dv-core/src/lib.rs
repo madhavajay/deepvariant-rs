@@ -3,6 +3,7 @@
 pub mod allelecounter;
 pub mod alt_aligned_pileup;
 pub mod direct_phasing;
+pub mod fuzzy_support;
 pub mod gvcf;
 pub mod make_examples;
 pub mod math;
