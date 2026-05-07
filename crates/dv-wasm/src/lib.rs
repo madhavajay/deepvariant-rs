@@ -140,6 +140,34 @@ pub fn example_variant_start(payload: &[u8]) -> Result<i64, JsError> {
     Ok(row.variant.start)
 }
 
+/// Decode a tf.Example payload and return the variant's
+/// `{chrom, start, end, ref, alts}` summary as a JSON string.
+/// Hand-rolled JSON instead of pulling in serde_json — the variant
+/// fields are simple ASCII so this stays small.
+#[cfg(feature = "wasm-bindgen")]
+#[wasm_bindgen]
+pub fn example_variant_summary(payload: &[u8]) -> Result<String, JsError> {
+    let row = parse_example(payload).map_err(|e| JsError::new(&e))?;
+    let v = &row.variant;
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    let alts = v
+        .alternate_bases
+        .iter()
+        .map(|a| format!("\"{}\"", esc(a)))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "{{\"chrom\":\"{}\",\"start\":{},\"end\":{},\"ref\":\"{}\",\"alts\":[{}]}}",
+        esc(&v.reference_name),
+        v.start,
+        v.end,
+        esc(&v.reference_bases),
+        alts,
+    ))
+}
+
 /// Number of channels the WGS pileup image carries. Exposed so JS
 /// glue can shape the input tensor correctly.
 #[cfg(feature = "wasm-bindgen")]

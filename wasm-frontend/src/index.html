@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepVariant in the browser</title>
+<style>
+    :root {
+        --fg: #1a1a1a;
+        --muted: #666;
+        --accent: #2562ed;
+        --pass: #2a7a2a;
+        --fail: #c33;
+        --warn: #b27200;
+        --border: #ddd;
+        --bg-soft: #f5f7fa;
+        --bg-drop: #eef4ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+        font: 14px/1.5 system-ui, -apple-system, sans-serif;
+        max-width: 1100px;
+        margin: 1.5em auto;
+        padding: 0 1em;
+        color: var(--fg);
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.2em; }
+    h1 small { color: var(--muted); font-weight: normal; font-size: 0.85rem; }
+    h2 { font-size: 1rem; margin: 0 0 0.5em; }
+    p { margin: 0.4em 0; }
+    code, .mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.92em; }
+
+    .panel {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1em 1.2em;
+        margin: 1em 0;
+        background: white;
+    }
+    .panel.muted { background: var(--bg-soft); }
+    .row { display: flex; gap: 0.8em; align-items: center; flex-wrap: wrap; }
+
+    button {
+        padding: 0.5em 1em;
+        font-size: 14px;
+        border: 1px solid var(--border);
+        background: white;
+        border-radius: 6px;
+        cursor: pointer;
+    }
+    button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:hover:not(:disabled) { filter: brightness(0.97); }
+
+    .status-line {
+        font-family: ui-monospace, Menlo, monospace;
+        padding: 0.5em 0.7em;
+        background: var(--bg-soft);
+        border-radius: 4px;
+        min-height: 1.5em;
+        font-size: 12px;
+    }
+
+    .progress {
+        height: 6px;
+        background: #e3e8ef;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 0.4em;
+    }
+    .progress > div {
+        height: 100%;
+        background: var(--accent);
+        width: 0%;
+        transition: width 0.15s ease-out;
+    }
+
+    .drop {
+        border: 2px dashed var(--border);
+        border-radius: 8px;
+        padding: 1.5em;
+        text-align: center;
+        color: var(--muted);
+        transition: background 0.1s, border-color 0.1s;
+    }
+    .drop.over { background: var(--bg-drop); border-color: var(--accent); color: var(--fg); }
+    .drop input[type=file] { display: none; }
+    .drop label.btn {
+        display: inline-block;
+        padding: 0.4em 0.9em;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: white;
+        cursor: pointer;
+        margin-top: 0.5em;
+    }
+
+    .badge {
+        display: inline-block;
+        padding: 1px 6px;
+        font-size: 11px;
+        border-radius: 3px;
+        background: var(--bg-soft);
+        color: var(--muted);
+        font-family: ui-monospace, Menlo, monospace;
+    }
+    .badge.ok { background: #e8f3e8; color: var(--pass); }
+    .badge.warn { background: #fff5e0; color: var(--warn); }
+    .badge.err { background: #fde7e7; color: var(--fail); }
+
+    table { border-collapse: collapse; width: 100%; margin-top: 0.6em; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+    th, td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #eee; white-space: nowrap; }
+    th { background: var(--bg-soft); position: sticky; top: 0; }
+    .scrollbox { max-height: 280px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+    .pass { color: var(--pass); }
+    .fail { color: var(--fail); font-weight: bold; }
+
+    .stats { display: flex; gap: 1.5em; margin-top: 0.5em; font-size: 13px; }
+    .stat .v { font-size: 1.4em; font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
+    .stat .l { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .note {
+        background: #fff8e0;
+        border: 1px solid #f0d878;
+        border-radius: 6px;
+        padding: 0.6em 0.9em;
+        font-size: 13px;
+        color: #5a4500;
+    }
+    .note code { background: #f5e8b0; padding: 0 3px; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<h1>DeepVariant in the browser <small>— dv-wasm + onnxruntime-web</small></h1>
+<p>Run the DeepVariant WGS model end-to-end on a <code>tf.Example</code> shard,
+entirely client-side. Decoding via the Rust → WASM port; inference via
+onnxruntime-web. The model is fetched once and cached; results download as a
+<code>.tar.gz</code>.</p>
+
+<div class="note" id="note-input-format">
+    <strong>Input format:</strong> a <code>tf.Example</code> shard (gzipped TFRecord, e.g.
+    <code>examples.tfrecord.gz</code> from <code>dv make-examples</code>).
+    Direct BAM/CRAM input in the browser isn't wired yet — make-examples
+    needs to be ported to WASM first
+    (<a href="https://github.com/google/deepvariant" target="_blank" rel="noopener">why</a>:
+    BAM/CRAM I/O lives in <code>dv-io</code> which isn't in the wasm build).
+</div>
+
+<!-- ───────────────── Step 1: WASM ───────────────── -->
+<div class="panel" id="panel-wasm">
+    <div class="row" style="justify-content: space-between;">
+        <h2>1. dv-wasm runtime <span class="badge" id="wasm-badge">not loaded</span></h2>
+        <button id="btn-load-wasm">Load WASM</button>
+    </div>
+    <div class="status-line" id="wasm-status">idle</div>
+</div>
+
+<!-- ───────────────── Step 2: Model ───────────────── -->
+<div class="panel" id="panel-model">
+    <div class="row" style="justify-content: space-between;">
+        <h2>2. WGS ONNX model <span class="badge" id="model-badge">not cached</span></h2>
+        <div class="row" style="gap: 0.5em;">
+            <button id="btn-clear-model" title="Clear cached model from browser storage">Clear cache</button>
+            <button id="btn-download-model" class="primary">Download model (~87MB)</button>
+        </div>
+    </div>
+    <div class="status-line" id="model-status">idle</div>
+    <div class="progress" id="model-progress" hidden><div></div></div>
+    <p class="mono" style="font-size: 11px; color: var(--muted); margin-top: 0.4em;">
+        source: <code id="model-url">./models/wgs.onnx</code>
+        · cached in: <code>CacheStorage["dv-model-v1"]</code>
+    </p>
+</div>
+
+<!-- ───────────────── Step 3: Run ───────────────── -->
+<div class="panel" id="panel-run">
+    <h2>3. Run inference</h2>
+
+    <div class="row" style="margin-bottom: 0.8em;">
+        <button id="btn-run-sample">Run on bundled chr20 test sample</button>
+        <span class="mono" style="color: var(--muted); font-size: 11px;">
+            <span id="sample-meta">testdata/examples.tfrecord.gz · 32 examples</span>
+        </span>
+    </div>
+
+    <div class="drop" id="drop">
+        Drag a <code>.tfrecord.gz</code> shard here
+        <br>
+        <label class="btn">
+            …or pick a file
+            <input id="file" type="file" accept=".gz,.tfrecord">
+        </label>
+    </div>
+
+    <div class="status-line" id="run-status" style="margin-top: 0.8em;">idle</div>
+    <div class="progress" id="run-progress" hidden><div></div></div>
+</div>
+
+<!-- ───────────────── Step 4: Results ───────────────── -->
+<div class="panel" id="panel-results" hidden>
+    <div class="row" style="justify-content: space-between;">
+        <h2>4. Results</h2>
+        <button id="btn-download" class="primary">Download .tar.gz</button>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="scrollbox" style="margin-top: 0.8em;">
+        <table id="results">
+            <thead><tr>
+                <th>#</th><th>chrom:pos</th><th>ref→alt</th><th>top class</th>
+                <th>P(hom-ref)</th><th>P(het)</th><th>P(hom-alt)</th>
+            </tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<script type="module" src="./main.mjs"></script>
+</body>
+</html>

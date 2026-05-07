@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+public/pkg/
+public/ort/
+public/models/
+public/testdata/
+test-results/
+playwright-report/
