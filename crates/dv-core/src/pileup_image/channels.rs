@@ -26,6 +26,20 @@ pub enum ChannelKind {
     ReadSupportsVariant,
     BaseDiffersFromRef,
     InsertSize,
+    /// Channel #9. Computed by re-rendering the pileup with reads
+    /// realigned to alt-haplotype #1 and taking the
+    /// `BaseDiffersFromRef` channel of that re-render. Populated by
+    /// `pileup_image::layout::render_alt_aligned_channel` rather than
+    /// the per-pixel encoders.
+    DiffChannelsAlternateAllele1,
+    /// Channel #10. Same as `DiffChannelsAlternateAllele1` but for the
+    /// second alt allele in a multi-allelic candidate; for a biallelic
+    /// candidate this duplicates allele-1.
+    DiffChannelsAlternateAllele2,
+    /// Channel #20. Re-rendered `ReadBase` against alt-haplotype #1.
+    BaseChannelsAlternateAllele1,
+    /// Channel #21. Re-rendered `ReadBase` against alt-haplotype #2.
+    BaseChannelsAlternateAllele2,
 }
 
 impl ChannelKind {
@@ -39,7 +53,50 @@ impl ChannelKind {
             4 => Self::Strand,
             5 => Self::ReadSupportsVariant,
             6 => Self::BaseDiffersFromRef,
+            9 => Self::DiffChannelsAlternateAllele1,
+            10 => Self::DiffChannelsAlternateAllele2,
             19 => Self::InsertSize,
+            20 => Self::BaseChannelsAlternateAllele1,
+            21 => Self::BaseChannelsAlternateAllele2,
+            _ => return None,
+        })
+    }
+
+    /// Whether this channel is filled by the alt-aligned re-render
+    /// path (`render_alt_aligned_channel`) rather than the per-pixel
+    /// encoders in the main `render` call.
+    pub fn is_alt_aligned(self) -> bool {
+        matches!(
+            self,
+            Self::DiffChannelsAlternateAllele1
+                | Self::DiffChannelsAlternateAllele2
+                | Self::BaseChannelsAlternateAllele1
+                | Self::BaseChannelsAlternateAllele2
+        )
+    }
+
+    /// For an alt-aligned channel, which alt allele index it tracks
+    /// (0 for `_1`, 1 for `_2`). Panics for non-alt-aligned channels;
+    /// callers should gate on `is_alt_aligned`.
+    pub fn alt_index(self) -> usize {
+        match self {
+            Self::DiffChannelsAlternateAllele1 | Self::BaseChannelsAlternateAllele1 => 0,
+            Self::DiffChannelsAlternateAllele2 | Self::BaseChannelsAlternateAllele2 => 1,
+            _ => panic!("alt_index called on non-alt-aligned channel"),
+        }
+    }
+
+    /// For an alt-aligned channel, the per-pixel encoder used during
+    /// the alt-haplotype re-render. Diff channels reuse the
+    /// `BaseDiffersFromRef` encoder; base channels reuse `ReadBase`.
+    pub fn alt_aligned_underlying(self) -> Option<Self> {
+        Some(match self {
+            Self::DiffChannelsAlternateAllele1 | Self::DiffChannelsAlternateAllele2 => {
+                Self::BaseDiffersFromRef
+            }
+            Self::BaseChannelsAlternateAllele1 | Self::BaseChannelsAlternateAllele2 => {
+                Self::ReadBase
+            }
             _ => return None,
         })
     }
