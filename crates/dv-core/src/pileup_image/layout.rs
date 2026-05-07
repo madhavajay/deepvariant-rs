@@ -182,7 +182,8 @@ fn read_pixel(
     read: &PileupRead<'_>,
     opts: &PileupOptions,
 ) -> u8 {
-    match kind {
+    let effective = kind.alt_aligned_underlying().unwrap_or(kind);
+    match effective {
         ChannelKind::ReadBase => channels::read_base_read(read_base, opts),
         ChannelKind::BaseQuality => channels::base_quality_read(base_q, opts),
         ChannelKind::MappingQuality => {
@@ -196,11 +197,19 @@ fn read_pixel(
             channels::base_differs_from_ref_read(read_base, ref_base, opts)
         }
         ChannelKind::InsertSize => channels::insert_size_read(read.fragment_length),
+        // alt_aligned_underlying() above already mapped these, so they
+        // can't reach here in practice — keep the arm to satisfy the
+        // exhaustiveness check.
+        ChannelKind::DiffChannelsAlternateAllele1
+        | ChannelKind::DiffChannelsAlternateAllele2
+        | ChannelKind::BaseChannelsAlternateAllele1
+        | ChannelKind::BaseChannelsAlternateAllele2 => unreachable!(),
     }
 }
 
 fn ref_pixel(kind: ChannelKind, ref_base: u8, opts: &PileupOptions) -> u8 {
-    match kind {
+    let effective = kind.alt_aligned_underlying().unwrap_or(kind);
+    match effective {
         ChannelKind::ReadBase => channels::read_base_ref(ref_base, opts),
         ChannelKind::BaseQuality => channels::base_quality_ref(opts),
         ChannelKind::MappingQuality => channels::mapping_quality_ref(opts),
@@ -208,6 +217,10 @@ fn ref_pixel(kind: ChannelKind, ref_base: u8, opts: &PileupOptions) -> u8 {
         ChannelKind::ReadSupportsVariant => channels::read_supports_variant_ref(opts),
         ChannelKind::BaseDiffersFromRef => channels::base_differs_from_ref_ref(opts),
         ChannelKind::InsertSize => channels::insert_size_ref(),
+        ChannelKind::DiffChannelsAlternateAllele1
+        | ChannelKind::DiffChannelsAlternateAllele2
+        | ChannelKind::BaseChannelsAlternateAllele1
+        | ChannelKind::BaseChannelsAlternateAllele2 => unreachable!(),
     }
 }
 
@@ -478,6 +491,251 @@ mod tests {
         for col in 0..4 {
             assert_eq!(img[col], 0, "col {col}");
         }
+    }
+
+    #[test]
+    fn leading_hard_clip_then_soft_clip_then_indel() {
+        // Read CIGAR: 5H 3S 4M 2D 3M
+        // - HARD_CLIP doesn't consume read or ref (bases don't appear in SEQ).
+        // - SOFT_CLIP advances `read_i` only, paints nothing.
+        // - 4M paints ref cols 0..3.
+        // - 2D paints anchor at col 3 (overwriting the prior M paint).
+        // - 3M paints ref cols 6..8.
+        // SEQ has 3 (soft-clipped) + 4 (M) + 3 (M) = 10 bases.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let bq = [40u8; 10];
+        let cigar = [('H', 5), ('S', 3), ('M', 4), ('D', 2), ('M', 3)];
+        let reads = vec![read(0, &cigar, b"NNNAAAAGGG", &bq, false)];
+        let img = render(0, 9, 6, 0, b"AAAAAAAAA", &reads, &kinds, &opts, None, 0);
+        // M region: cols 0,1,2 paint A's (col 3 will be overwritten by anchor).
+        for col in 0..3 {
+            assert_eq!(img[col], channels::base_color(b'A', &opts), "M col {col}");
+        }
+        // Col 3: anchor (overwrites the 4th M paint).
+        assert_eq!(img[3], 0, "delete anchor at col 3");
+        // Cols 4,5: untouched (deletion span).
+        assert_eq!(img[4], 0);
+        assert_eq!(img[5], 0);
+        // Cols 6,7,8: G's from the trailing M.
+        for col in 6..9 {
+            assert_eq!(img[col], channels::base_color(b'G', &opts), "M col {col}");
+        }
+    }
+
+    #[test]
+    fn long_insertion_paints_one_anchor_only() {
+        // Many-base insertion (50I) should still paint exactly one anchor
+        // pixel — at ref_i-1 — regardless of insertion length, because
+        // upstream's CalculateChannels treats the entire insertion as one
+        // event for anchor purposes.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let mut seq = b"AA".to_vec();
+        seq.extend(std::iter::repeat(b'C').take(50));
+        seq.extend_from_slice(b"GG");
+        let bq = vec![40u8; seq.len()];
+        let cigar = [('M', 2), ('I', 50), ('M', 2)];
+        let reads = vec![read(0, &cigar, &seq, &bq, false)];
+        let img = render(0, 6, 6, 0, b"AAAAAA", &reads, &kinds, &opts, None, 0);
+        // Col 0: A.
+        assert_eq!(img[0], channels::base_color(b'A', &opts));
+        // Col 1: anchor (overwrites prior M paint).
+        assert_eq!(img[1], 0);
+        // Cols 2,3: G's (the 2M after the insertion).
+        assert_eq!(img[2], channels::base_color(b'G', &opts));
+        assert_eq!(img[3], channels::base_color(b'G', &opts));
+        // Cols 4,5: zero (image ends past the read).
+        assert_eq!(img[4], 0);
+        assert_eq!(img[5], 0);
+    }
+
+    #[test]
+    fn long_deletion_paints_one_anchor_only() {
+        // Long deletion (50D): same one-anchor invariant. Within-deletion
+        // columns stay zero; trailing 2M paints normally.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let bq = [40u8; 4];
+        let cigar = [('M', 2), ('D', 50), ('M', 2)];
+        let reads = vec![read(0, &cigar, b"AAGG", &bq, false)];
+        let mut ref_bases = vec![b'A'; 60];
+        for c in &mut ref_bases[52..54] { *c = b'G'; }  // not actually used, just for clarity
+        let _ = ref_bases; // keep shape; we use vec![b'A'; 60] below
+        let img = render(0, 60, 6, 0, &vec![b'A'; 60], &reads, &kinds, &opts, None, 0);
+        // Col 0: A.
+        assert_eq!(img[0], channels::base_color(b'A', &opts));
+        // Col 1: anchor.
+        assert_eq!(img[1], 0);
+        // Cols 2..52: zero (deletion span).
+        for col in 2..52 {
+            assert_eq!(img[col], 0, "deletion span col {col}");
+        }
+        // Cols 52,53: G's (the 2M after the deletion).
+        assert_eq!(img[52], channels::base_color(b'G', &opts));
+        assert_eq!(img[53], channels::base_color(b'G', &opts));
+    }
+
+    #[test]
+    fn insertion_at_contig_start_paints_no_anchor() {
+        // Read: 3I 5M starting at ref_start=0. The insertion would want to
+        // paint anchor at ref_i-1 = -1 — the `if ref_i > 0` short-circuit
+        // must prevent that. The 5M paints normally on cols 0..4.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let bq = [40u8; 8];
+        let cigar = [('I', 3), ('M', 5)];
+        let reads = vec![read(0, &cigar, b"NNNAAAAA", &bq, false)];
+        let img = render(0, 6, 6, 0, b"AAAAAA", &reads, &kinds, &opts, None, 0);
+        // No anchor painted — cols 0..4 should all be A pixels.
+        for col in 0..5 {
+            assert_eq!(
+                img[col],
+                channels::base_color(b'A', &opts),
+                "M col {col} should be A (no anchor at contig start)"
+            );
+        }
+        // Col 5: zero (no read coverage).
+        assert_eq!(img[5], 0);
+    }
+
+    #[test]
+    fn deletion_at_contig_start_paints_no_anchor() {
+        // 5D 5M starting at ref_start=0. The DELETE wants to paint anchor at
+        // (ref_i-1, read_i-1) but read_i==0 short-circuits it; ref_i is then
+        // bumped to 5 and the 5M paints cols 5..9.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let bq = [40u8; 5];
+        let cigar = [('D', 5), ('M', 5)];
+        let reads = vec![read(0, &cigar, b"GGGGG", &bq, false)];
+        let img = render(0, 12, 6, 0, &vec![b'A'; 12], &reads, &kinds, &opts, None, 0);
+        // Cols 0..4: untouched (within-deletion + before-read).
+        for col in 0..5 {
+            assert_eq!(img[col], 0, "pre-read col {col}");
+        }
+        // Cols 5..9: G's from the 5M.
+        for col in 5..10 {
+            assert_eq!(img[col], channels::base_color(b'G', &opts), "M col {col}");
+        }
+    }
+
+    #[test]
+    fn read_starting_inside_image_with_indel_at_first_op() {
+        // ref_start>0 but the first CIGAR op is an INSERT. Anchor SHOULD be
+        // painted because ref_i > 0 (it's the read's start, not the contig's
+        // start). Verifies the short-circuit is keyed on contig-start, not
+        // read-start.
+        let opts = PileupOptions::default();
+        let kinds = [ChannelKind::ReadBase];
+        let bq = [40u8; 5];
+        let cigar = [('I', 2), ('M', 3)];
+        let reads = vec![read(3, &cigar, b"NNAAA", &bq, false)];
+        let img = render(0, 8, 6, 0, b"AAAAAAAA", &reads, &kinds, &opts, None, 0);
+        // Cols 0,1: zero (before read).
+        assert_eq!(img[0], 0);
+        assert_eq!(img[1], 0);
+        // Col 2: insertion anchor (ref_i-1 == 2).
+        assert_eq!(img[2], 0);
+        // Cols 3,4,5: A's from 3M.
+        for col in 3..6 {
+            assert_eq!(img[col], channels::base_color(b'A', &opts), "M col {col}");
+        }
+    }
+
+    #[test]
+    fn alt_aligned_channel_routes_through_underlying_encoder() {
+        // The alt-aligned ChannelKind variants don't have their own
+        // per-pixel encoders — they reuse `BaseDiffersFromRef` (for
+        // diff channels) and `ReadBase` (for base channels). The caller
+        // provides an alt-haplotype reference + reads realigned to it
+        // and the existing render() machinery does the rest. This test
+        // verifies the routing by rendering the same inputs through
+        // (a) the alt-aligned channel kind and (b) its underlying kind
+        // and asserting the byte output is identical.
+        let opts = PileupOptions::default();
+        let bq = [40u8; 4];
+        let reads = vec![read(0, &[('M', 4)], b"ACGT", &bq, false)];
+
+        // Diff variant — both alleles round-trip through BaseDiffersFromRef.
+        let img_d1 = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::DiffChannelsAlternateAllele1], &opts, None, 0);
+        let img_d2 = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::DiffChannelsAlternateAllele2], &opts, None, 0);
+        let img_diff_ref = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::BaseDiffersFromRef], &opts, None, 0);
+        assert_eq!(img_d1, img_diff_ref, "Diff#1 ≠ BaseDiffersFromRef");
+        assert_eq!(img_d2, img_diff_ref, "Diff#2 ≠ BaseDiffersFromRef");
+
+        // Base variant — both alleles round-trip through ReadBase.
+        let img_b1 = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::BaseChannelsAlternateAllele1], &opts, None, 0);
+        let img_b2 = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::BaseChannelsAlternateAllele2], &opts, None, 0);
+        let img_base_ref = render(
+            0, 4, 6, 0, b"AAAA", &reads,
+            &[ChannelKind::ReadBase], &opts, None, 0);
+        assert_eq!(img_b1, img_base_ref, "Base#1 ≠ ReadBase");
+        assert_eq!(img_b2, img_base_ref, "Base#2 ≠ ReadBase");
+    }
+
+    #[test]
+    fn alt_aligned_render_with_realigned_reads_smoke() {
+        // End-to-end smoke for the alt-aligned re-render flow: build an
+        // alt-haplotype window via `alt_aligned_pileup::build_alt_haplotype_ref`,
+        // realign a read to it via `realign_to_alt_haplotype`, then feed
+        // the realigned read + alt-haplotype ref to `render()` with the
+        // alt-aligned channel kinds. The result should be a non-empty
+        // image (non-zero bytes in the expected columns).
+        use crate::alt_aligned_pileup::{build_alt_haplotype_ref, realign_to_alt_haplotype};
+        use crate::realigner::ssw::ScoreParams;
+
+        let opts = PileupOptions::default();
+        let image_start: i64 = 100;
+        let ref_window = b"AAAAAAAAAATAAAAAAAAA"; // T at offset 10 ≡ position 110
+        let alt = build_alt_haplotype_ref(ref_window, image_start, 110, 111, b"G").unwrap();
+
+        // A read covering the variant, carrying the alt allele.
+        let read_seq = b"AAAAAAAAAAGAAAAAAAAA";
+        let bq = [40u8; 20];
+        let aln = realign_to_alt_haplotype(read_seq, &alt, image_start, ScoreParams::default())
+            .expect("ssw aln");
+        assert!(aln.score > 0);
+
+        // Map SSW's CIGAR ops to the format the renderer expects (it
+        // already takes &[(char,i64)], same as the SSW output here).
+        let realigned = PileupRead {
+            ref_start: aln.ref_start,
+            cigar: &aln.cigar,
+            seq: read_seq.as_slice(),
+            base_quality: bq.as_slice(),
+            mapping_quality: 60,
+            is_reverse_strand: false,
+            fragment_length: 300,
+            supports_variant: true,
+            hp_tag: 0,
+            fragment_name: "alt_smoke",
+            read_number: 0,
+        };
+
+        let kinds = [ChannelKind::BaseChannelsAlternateAllele1];
+        let img = render(
+            image_start, alt.len(), 4, 0, &alt, std::slice::from_ref(&realigned),
+            &kinds, &opts, None, 0,
+        );
+        // The first read row should have non-zero pixels matching the
+        // ReadBase color of A (and G at the variant).
+        let row_off = 0;  // reference_band_height=0
+        let mut nonzero = 0;
+        for col in 0..alt.len() {
+            if img[row_off + col] != 0 { nonzero += 1; }
+        }
+        assert!(nonzero > 0, "alt-aligned render should paint some pixels");
     }
 
     #[test]
