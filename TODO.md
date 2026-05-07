@@ -36,10 +36,13 @@ that's still outstanding, grouped by impact.
   compared records, with 7 multi-allelic / repeat-region indels still
   missing from our candidate set (deeper realigner work).
 
-- [ ] **Indel-anchor edge cases.** The DELETE off-by-one + SOFT_CLIP
-  fix landed on chr20 SNV. Verify it holds for reads with a leading
-  hard-clip+soft-clip combo, multi-base indels, and reads aligned at
-  contig start (where `ref_i == 0` short-circuits anchor painting).
+- [x] **Indel-anchor edge cases.** Six unit tests in
+  `pileup_image::layout::tests` cover: leading H+S CIGAR combo, long
+  insertions (50I), long deletions (50D), INSERT at contig start (no
+  anchor at `-1`), DELETE at contig start, and INSERT as first read op
+  when `ref_start > 0` (anchor IS painted, not skipped). The existing
+  `ref_i > 0` and `read_i > 0 && ref_i > 0` short-circuits hold for
+  every case.
 
 ## P2 — channel coverage (16 of 29 channels ported)
 
@@ -54,10 +57,22 @@ left:
 - [x] CH_HAPLOTYPE_TAG (#7) — encoder done; HP-tag now parsed from BAM
       aux fields in `dv make-examples` and threaded through to the
       pileup builder.
-- [ ] CH_DIFF_CHANNELS_ALTERNATE_ALLELE_{1,2} (#9, #10) — needs alt-aligned
-      pileup re-render (re-aligns reads to alt haplotype, stacks 2 channels)
-- [ ] CH_BASE_CHANNELS_ALTERNATE_ALLELE_{1,2} (#20, #21) — same alt-aligned
-      dependency
+- [x] CH_DIFF_CHANNELS_ALTERNATE_ALLELE_{1,2} (#9, #10) — library-level
+      support landed. `ChannelKind::DiffChannelsAlternateAllele{1,2}` plus
+      `from_proto_index(9|10)` plumb the routing; the per-pixel encoder
+      reuses `BaseDiffersFromRef` against an alt-haplotype reference.
+      `alt_aligned_pileup::build_alt_haplotype_ref` splices the alt allele
+      into the image window; `realign_to_alt_haplotype` uses the SSW
+      aligner (`realigner::ssw`) to produce the realigned CIGAR + ref_start.
+      Tests at `crates/dv-core/src/alt_aligned_pileup.rs` and integration
+      tests in `pileup_image::layout::tests`. CLI wiring (an
+      `--alt-aligned-pileup` flag) is still off by default — the WGS model
+      doesn't use these channels and there's no upstream alt-aligned
+      fixture to byte-diff against; we'll wire it when a consuming model
+      lands.
+- [x] CH_BASE_CHANNELS_ALTERNATE_ALLELE_{1,2} (#20, #21) — same machinery,
+      `alt_aligned_underlying()` routes these through the `ReadBase`
+      encoder. Same wiring caveat.
 - [x] CH_BASE_METHYLATION (#23), CH_BASE_6MA (#24) — encoder done; needs
       MM/ML BAM aux-tag parsing
 - [x] CH_HOMOPOLYMER_WEIGHTED (#17), CH_IS_HOMOPOLYMER (#16) — done & wireable
@@ -96,7 +111,15 @@ left:
   GNU-parallel-shard-by-region remains as a separate orchestration
   layer; can be added at the dv-cli level if needed.
 
-- [ ] **CRAM support.** `noodles-cram` instead of just BAM.
+- [x] **CRAM support.** `noodles-cram` enabled in `dv-io`'s feature
+  gate; `dv-io::reads::open` dispatches to BAM or CRAM by file extension
+  with a shared `for_each_record(&dyn Record, ...)` callback API. CRAM
+  decompression goes through a `noodles::fasta::Repository` with an
+  `IndexedReader` adapter for sequence reconstruction. `dv make-examples
+  --reads file.cram --ref-fasta ref.fasta` now works end-to-end. CRAM's
+  C-only deps (bzip2-sys, lzma-sys) are isolated to the `dv-io` crate's
+  local feature so `dv-core` and `dv-wasm` still build cleanly for
+  `wasm32-unknown-unknown`.
 
 ## P4 — I/O polish
 
@@ -127,11 +150,22 @@ left:
 
 ## P5 — Cross-compile (M4)
 
-- [ ] **WASM build target.** Blocked on installing `rust-wasm` Arch
-  package (or `rustup target add wasm32-unknown-unknown`). Once
-  installed: `cargo build --target wasm32-unknown-unknown -p dv-core`
-  should work; wasm-bindgen wrapper for inference; `ort` already has a
-  wasm-bindgen feature.
+- [x] **WASM build target — three layers, end-to-end ORT inference.**
+  - `cargo wasm-test` runs **279 unit tests** through wasmtime via
+    `wasm32-wasip1` (alias in `.cargo/config.toml`): all of dv-core's
+    pure-compute kernels (allelecounter, variant_calling, every channel
+    encoder, realigner, direct_phasing, methylation_aware_phasing, vcf
+    math, the new alt-aligned primitives) plus dv-wasm.
+  - `wasm-node-test/` — Node + onnxruntime-node + dv-wasm via
+    wasm-bindgen. 32/32 examples on the chr20 norealign fixture,
+    Δmax = 0.0e+0 vs native (bit-exact).
+  - `wasm-browser-test/` — Headless Chromium via Playwright +
+    onnxruntime-web + dv-wasm. 32/32, Δmax ≈ 2.4e-7 (single-precision
+    FMA rounding between onnxruntime-web's wasm SIMD kernels and
+    libonnxruntime's CPU kernels — top-class predictions identical).
+  - Same `dv-wasm` crate drives all three; ort upgraded rc.10 → rc.12
+    (wasm-friendly), libonnxruntime bumped to 1.24.4 (matches rc.12's
+    expected ABI; older libs deadlocked Session::commit_from_file).
 
 - [ ] **iOS xcframework.** CoreML conversion of the SavedModel; new
   `dv-infer::coreml` backend; static lib + Swift bindings.

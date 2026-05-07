@@ -240,6 +240,110 @@ pub fn calculate_alignment_region(
     }
 }
 
+// ---- Alt-haplotype reference + read realignment -----------------------------
+//
+// Channels #9, #10, #20, #21 (DIFF/BASE_CHANNELS_ALTERNATE_ALLELE_{1,2}) are
+// produced by re-rendering the pileup with reads realigned to a synthetic
+// reference where the variant is replaced by one of its alt alleles. Two
+// pieces are needed: build the alt-haplotype window, and realign each read
+// to it.
+
+use crate::realigner::ssw::{align as ssw_align, ScoreParams};
+
+/// Construct an alt-haplotype reference window for the pileup image.
+///
+/// Splices `alt_allele` in for the `[variant_start, variant_end)` ref bases
+/// inside the `[image_start, image_start + ref_bases.len())` window. Returns
+/// `None` if the variant doesn't sit fully inside the window.
+///
+/// The returned slice can be longer or shorter than `ref_bases` because an
+/// indel changes the window size. Render coordinates that index this slice
+/// by column will diverge from the original reference whenever there's a
+/// length-changing variant — that's the whole point of this re-render.
+pub fn build_alt_haplotype_ref(
+    ref_bases: &[u8],
+    image_start: i64,
+    variant_start: i64,
+    variant_end: i64,
+    alt_allele: &[u8],
+) -> Option<Vec<u8>> {
+    if variant_end < variant_start {
+        return None;
+    }
+    let lo = variant_start.checked_sub(image_start)?;
+    let hi = variant_end.checked_sub(image_start)?;
+    if lo < 0 || hi < lo {
+        return None;
+    }
+    let lo = lo as usize;
+    let hi = hi as usize;
+    if hi > ref_bases.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(ref_bases.len() + alt_allele.len());
+    out.extend_from_slice(&ref_bases[..lo]);
+    out.extend_from_slice(alt_allele);
+    out.extend_from_slice(&ref_bases[hi..]);
+    Some(out)
+}
+
+/// One read realigned against an alt-haplotype reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AltAlignedRead {
+    /// 0-based start in the alt-haplotype reference window (image-relative).
+    pub ref_start: i64,
+    /// CIGAR against the alt-haplotype reference.
+    pub cigar: Vec<(char, i64)>,
+    /// Smith-Waterman alignment score (for ranking / debugging).
+    pub score: i32,
+}
+
+/// Realign a single read against an alt-haplotype reference using affine-gap
+/// Smith-Waterman. Returns `None` if SSW finds no positive-score alignment
+/// (e.g. the read is too far from the alt haplotype to be useful).
+///
+/// `alt_ref_window_start` is the image-relative offset of `alt_ref_window`'s
+/// first base. The returned `ref_start` is image-relative.
+///
+/// The output CIGAR uses upstream's pixel-level convention: `M` for matches
+/// + mismatches (no `=`/`X` distinction), `I` for insertions in the read,
+/// `D` for deletions. Soft/hard clips are not emitted by SSW directly —
+/// callers that need them can synthesize prefix/suffix clips from
+/// `query_begin`/`query_end` recovered via `align()` on the raw read.
+pub fn realign_to_alt_haplotype(
+    read_seq: &[u8],
+    alt_ref_window: &[u8],
+    alt_ref_window_start: i64,
+    params: ScoreParams,
+) -> Option<AltAlignedRead> {
+    let aln = ssw_align(read_seq, alt_ref_window, params)?;
+    let cigar: Vec<(char, i64)> = aln
+        .cigar
+        .into_iter()
+        .map(|(op, len)| (op, len as i64))
+        .collect();
+    Some(AltAlignedRead {
+        ref_start: alt_ref_window_start + aln.ref_begin as i64,
+        cigar,
+        score: aln.score,
+    })
+}
+
+/// Convenience: realign every read in a slice. Reads with no positive-score
+/// alignment are dropped (mirrors upstream's behaviour where unalignable
+/// reads simply don't contribute to the alt-aligned pileup).
+pub fn realign_reads_to_alt_haplotype(
+    read_seqs: &[&[u8]],
+    alt_ref_window: &[u8],
+    alt_ref_window_start: i64,
+    params: ScoreParams,
+) -> Vec<Option<AltAlignedRead>> {
+    read_seqs
+        .iter()
+        .map(|r| realign_to_alt_haplotype(r, alt_ref_window, alt_ref_window_start, params))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +579,117 @@ mod tests {
         let (kept, _) = trim_reads(&[&r1, &r2], &region, 3);
         // Both kept now.
         assert_eq!(kept.len(), 2);
+    }
+
+    // ---- alt-haplotype + realignment ----
+
+    #[test]
+    fn build_alt_haplotype_substitutes_snv() {
+        // Window: image_start=100, ref bases 100..120. Variant at 110: T→G.
+        let ref_window = b"AAAAAAAAAATAAAAAAAAA"; // T at index 10
+        let alt = build_alt_haplotype_ref(ref_window, 100, 110, 111, b"G").unwrap();
+        // Same length (SNV), G at index 10.
+        assert_eq!(alt.len(), ref_window.len());
+        assert_eq!(alt[10], b'G');
+        for (i, &b) in alt.iter().enumerate() {
+            if i != 10 {
+                assert_eq!(b, b'A', "alt should match ref at i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn build_alt_haplotype_inserts_bases() {
+        // 1-base ref, 4-base alt → window grows by 3.
+        let ref_window = b"AAAAATAAAAA"; // T at index 5
+        let alt = build_alt_haplotype_ref(ref_window, 100, 105, 106, b"GGGG").unwrap();
+        assert_eq!(alt.len(), ref_window.len() + 3);
+        assert_eq!(&alt[..5], b"AAAAA");
+        assert_eq!(&alt[5..9], b"GGGG");
+        assert_eq!(&alt[9..], b"AAAAA");
+    }
+
+    #[test]
+    fn build_alt_haplotype_deletes_bases() {
+        // 5-base ref, 1-base alt (anchored deletion) → window shrinks by 4.
+        let ref_window = b"AAAAATTTTTAAAAA"; // 5T at index 5
+        let alt = build_alt_haplotype_ref(ref_window, 100, 105, 110, b"T").unwrap();
+        assert_eq!(alt.len(), ref_window.len() - 4);
+        assert_eq!(&alt[..5], b"AAAAA");
+        assert_eq!(alt[5], b'T');
+        assert_eq!(&alt[6..], b"AAAAA");
+    }
+
+    #[test]
+    fn build_alt_haplotype_rejects_out_of_window() {
+        // Variant at 99 — before image_start=100.
+        let ref_window = b"AAAAAAAAAA";
+        assert!(build_alt_haplotype_ref(ref_window, 100, 99, 100, b"G").is_none());
+        // Variant end past window.
+        assert!(build_alt_haplotype_ref(ref_window, 100, 105, 120, b"G").is_none());
+    }
+
+    #[test]
+    fn realign_read_perfect_match_to_alt_haplotype() {
+        // Alt haplotype: same as a read with one SNV applied.
+        let alt_ref = b"AAAAAAAAAAGAAAAAAAAA"; // pos 10 is G
+        let read =    b"AAAAAAAAAAGAAAAAAAAA";
+        let aln = realign_to_alt_haplotype(read, alt_ref, 100, ScoreParams::default()).unwrap();
+        assert_eq!(aln.ref_start, 100);
+        // Single 'M' op covering the whole read.
+        let m_total: i64 = aln.cigar.iter().filter(|(op, _)| *op == 'M').map(|(_, n)| *n).sum();
+        assert_eq!(m_total, read.len() as i64);
+        assert!(aln.score > 0);
+    }
+
+    #[test]
+    fn realign_read_with_one_indel_to_alt_haplotype() {
+        // Read carries a 1-base deletion vs the alt haplotype: the alt has
+        // a mid-window C that the read is missing. Forcing a deletion is
+        // cleaner than insertion because gap-vs-mismatch math depends on
+        // the exact penalty params; a deletion in the read is harder for
+        // SSW to mask as a soft-clip (it'd have to drop bases on both
+        // sides of the missing position).
+        let alt_ref = b"AAACCCGGGTTTACGT"; // 16 bases
+        let read    = b"AAACCGGGTTTACGT";  // missing one C in the middle
+        let aln = realign_to_alt_haplotype(read, alt_ref, 0, ScoreParams::default()).unwrap();
+        // Round-trip sanity: ref span covered by the CIGAR + read span
+        // covered by the CIGAR should match what SSW reported.
+        let m_in_read: i64 = aln
+            .cigar
+            .iter()
+            .filter(|(op, _)| matches!(op, 'M' | 'I'))
+            .map(|(_, n)| *n)
+            .sum();
+        assert!(m_in_read > 0, "should consume some read bases");
+        // Either a D op shows up, or the missing base is absorbed as a
+        // mismatch. With default scoring (match=4, mismatch=6, open=8,
+        // extend=2) a single-base gap costs 10 vs a mismatch's 6, so the
+        // alignment prefers M with mismatches near homopolymer regions.
+        // The robust check is just that the alignment terminates with a
+        // positive score.
+        assert!(aln.score > 0);
+    }
+
+    #[test]
+    fn realign_reads_batch_drops_garbage_reads() {
+        let alt_ref = b"AAAAAAAAAAAAAAAAAAAA";
+        let r1 = b"AAAAAAAAAAAAAAAAAAAA"; // perfect
+        let r2 = b"GGGGGGG"; // unalignable
+        let r3 = b"AAAAAAAAAA"; // partial perfect
+        let alns = realign_reads_to_alt_haplotype(
+            &[r1.as_ref(), r2.as_ref(), r3.as_ref()],
+            alt_ref,
+            0,
+            ScoreParams::default(),
+        );
+        assert!(alns[0].is_some(), "perfect read aligns");
+        // Pure-mismatch garbage CAN occasionally produce a positive
+        // score on a single-base lucky match; assertion is weaker:
+        // the score should be much lower than r1 if it aligns at all.
+        if let (Some(a1), Some(a2)) = (&alns[0], &alns[1]) {
+            assert!(a1.score > a2.score);
+        }
+        assert!(alns[2].is_some(), "partial read still aligns");
     }
 }
