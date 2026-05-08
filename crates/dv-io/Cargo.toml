@@ -14,5 +14,6 @@ bytes.workspace = true
 noodles = { workspace = true, features = ["cram"] }
 crc32c.workspace = true
 flate2.workspace = true
+rayon.workspace = true
 prost.workspace = true
 dv-proto = { path = "../dv-proto" }

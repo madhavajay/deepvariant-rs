@@ -686,6 +686,7 @@ dependencies = [
  "flate2",
  "noodles",
  "prost",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

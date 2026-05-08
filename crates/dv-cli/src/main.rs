@@ -181,6 +181,11 @@ fn parse_contigs(specs: &[String]) -> Result<Vec<ContigInfo>> {
 /// re-parsing the BAM.
 struct OwnedRead {
     ref_start: i64,
+    /// `ref_start + sum(M/=/X/D/N CIGAR ops)`. Cached at BAM-load time
+    /// because the overlap filters in realigner / pass2_render call
+    /// this for every read on every query — recomputing it from the
+    /// CIGAR on each call dominates make_examples on big regions.
+    ref_end: i64,
     cigar: Vec<(char, i64)>,
     seq: Vec<u8>,
     bq: Vec<u8>,
@@ -218,6 +223,13 @@ fn make_examples_cmd(
     let region = ranges::parse_literal(region_literal).map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!(?reads_path, ?ref_path, ?examples_path, region=?region, "make_examples");
 
+    let mut stage_t = std::time::Instant::now();
+    let lap = |label: &str, t: &mut std::time::Instant| {
+        let dt = t.elapsed();
+        tracing::info!(stage = label, ms = dt.as_millis() as u64, "stage");
+        *t = std::time::Instant::now();
+    };
+
     let fa = dv_io::fasta::open_indexed(ref_path).context("open FASTA")?;
     let ref_bases = fa
         .fetch_range(&region.reference_name, region.start, region.end)
@@ -249,7 +261,7 @@ fn make_examples_cmd(
     let (_h, mut reader) =
         dv_io::reads::open(reads_path, Some(ref_path)).context("open alignment input")?;
     let mut owned: Vec<OwnedRead> = Vec::new();
-    reader.for_each_record(&_h, |r| {
+    reader.for_each_record_in_region(&_h, &region.reference_name, region.start, region.end, |r| {
         let Some(start) = r.alignment_start() else { return Ok(()) };
         let start_0based = usize::from(start.unwrap()) as i64 - 1;
         // Filter reads matching upstream's read_requirements default:
@@ -319,6 +331,7 @@ fn make_examples_cmd(
         };
         owned.push(OwnedRead {
             ref_start: start_0based,
+            ref_end: start_0based + read_len_on_ref,
             cigar: cigar_owned,
             seq,
             bq,
@@ -332,6 +345,19 @@ fn make_examples_cmd(
         Ok(())
     })?;
     tracing::info!(reads_loaded = owned.len(), "loaded reads");
+    lap("bam_read", &mut stage_t);
+
+    // Sort by ref_start so we can binary-search a per-query slice
+    // instead of scanning all reads. BAM is mostly already sorted but
+    // reads with the same start can come in any order; sort_by_key is
+    // stable and cheap on already-sorted data.
+    owned.sort_by_key(|r| r.ref_start);
+    let read_starts: Vec<i64> = owned.iter().map(|r| r.ref_start).collect();
+    // Largest "footprint" of any read so a query [qs, qe] only needs to
+    // look at reads with `ref_start >= qs - max_read_span`. Reads here
+    // are <300bp typically; this caps the lower-bound search distance.
+    let max_read_span: i64 = owned.iter().map(|r| r.ref_end - r.ref_start).max().unwrap_or(0);
+    lap("bam_sort", &mut stage_t);
 
     // Run allele counter.
     for r in &owned {
@@ -348,9 +374,12 @@ fn make_examples_cmd(
         add_read(&mut counts, &aligned, &counter_opts, region.start);
     }
 
+    lap("allele_counter", &mut stage_t);
+
     // Run candidate caller.
     let mut cands = candidates_from_counts(&counts, &VariantCallerOptions::default());
     tracing::info!(initial_candidates = cands.len(), "candidate variants");
+    lap("candidate_caller", &mut stage_t);
 
     // Realigner-driven candidate expansion: walk window_selector hot spots,
     // assemble a de Bruijn graph from local reads, and add any haplotype-vs-ref
@@ -379,6 +408,65 @@ fn make_examples_cmd(
             }
         }
 
+        let dbg_opts = DeBruijnOptions::default();
+
+        // Pre-fetch FASTA windows serially (the Indexed FASTA reader
+        // wraps a RefCell and is !Sync — can't be shared across rayon
+        // threads). Each fetch is cheap; the heavy work is the DBG
+        // build below.
+        let win_refs: Vec<Option<Vec<u8>>> = merged
+            .iter()
+            .map(|(ws, we)| {
+                fa.fetch_range(&region.reference_name, *ws, *we)
+                    .filter(|b| b.len() == (we - ws) as usize)
+            })
+            .collect();
+
+        // Parallel: build a DBG per window, expand each candidate
+        // haplotype into variants. Each window's work is independent;
+        // dedupe against the existing candidate set happens serially
+        // after the par_iter.
+        use rayon::prelude::*;
+        let new_cands: Vec<Variant> = merged
+            .par_iter()
+            .zip(win_refs.par_iter())
+            .filter_map(|((ws, we), win_ref_opt)| {
+                let win_ref = win_ref_opt.as_ref()?;
+                // Binary-search the candidate slice of reads, then
+                // filter by the precomputed ref_end. This avoids the
+                // O(reads) linear scan and the O(cigar) walk per read.
+                let lo = read_starts.partition_point(|&s| s + max_read_span <= *ws);
+                let hi = read_starts.partition_point(|&s| s < *we);
+                let win_reads: Vec<&OwnedRead> = owned[lo..hi]
+                    .iter()
+                    .filter(|r| r.ref_end > *ws)
+                    .collect();
+                let read_inputs: Vec<ReadInput<'_>> = win_reads
+                    .iter()
+                    .map(|r| ReadInput {
+                        aligned_sequence: &r.seq,
+                        aligned_quality: &r.bq,
+                        mapping_quality: r.mq,
+                    })
+                    .collect();
+                let graph = DeBruijnGraph::build(win_ref, &read_inputs, &dbg_opts)?;
+                let mut out: Vec<Variant> = Vec::new();
+                for hap in graph.candidate_haplotypes() {
+                    if hap.as_slice() == win_ref {
+                        continue;
+                    }
+                    for nv in
+                        variants_from_haplotype(&region.reference_name, *ws, win_ref, &hap)
+                    {
+                        out.push(nv);
+                    }
+                }
+                Some(out)
+            })
+            .flatten()
+            .collect();
+
+        // Serial dedupe + merge into shared candidate list.
         let mut existing: std::collections::HashSet<(i64, String, Vec<String>)> =
             std::collections::HashSet::new();
         for v in &cands {
@@ -386,53 +474,14 @@ fn make_examples_cmd(
             alts.sort();
             existing.insert((v.start, v.reference_bases.clone(), alts));
         }
-
-        let dbg_opts = DeBruijnOptions::default();
         let mut added = 0usize;
-        for (ws, we) in &merged {
-            let win_ref = match fa.fetch_range(&region.reference_name, *ws, *we) {
-                Some(b) if b.len() == (we - ws) as usize => b,
-                _ => continue,
-            };
-            // Find reads overlapping this window.
-            let win_reads: Vec<&OwnedRead> = owned
-                .iter()
-                .filter(|r| {
-                    let read_len_on_ref: i64 = r
-                        .cigar
-                        .iter()
-                        .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
-                        .map(|(_, l)| *l)
-                        .sum();
-                    let read_end = r.ref_start + read_len_on_ref;
-                    r.ref_start < *we && read_end > *ws
-                })
-                .collect();
-            let read_inputs: Vec<ReadInput<'_>> = win_reads
-                .iter()
-                .map(|r| ReadInput {
-                    aligned_sequence: &r.seq,
-                    aligned_quality: &r.bq,
-                    mapping_quality: r.mq,
-                })
-                .collect();
-            let graph = match DeBruijnGraph::build(&win_ref, &read_inputs, &dbg_opts) {
-                Some(g) => g,
-                None => continue,
-            };
-            for hap in graph.candidate_haplotypes() {
-                if hap.as_slice() == win_ref {
-                    continue;
-                }
-                for nv in variants_from_haplotype(&region.reference_name, *ws, &win_ref, &hap) {
-                    let mut alts = nv.alternate_bases.clone();
-                    alts.sort();
-                    let key = (nv.start, nv.reference_bases.clone(), alts);
-                    if existing.insert(key) {
-                        cands.push(nv);
-                        added += 1;
-                    }
-                }
+        for nv in new_cands {
+            let mut alts = nv.alternate_bases.clone();
+            alts.sort();
+            let key = (nv.start, nv.reference_bases.clone(), alts);
+            if existing.insert(key) {
+                cands.push(nv);
+                added += 1;
             }
         }
         // Keep candidates sorted by genomic coord for deterministic output.
@@ -450,6 +499,7 @@ fn make_examples_cmd(
             "realigner candidate expansion"
         );
     }
+    lap("realigner", &mut stage_t);
 
     // ---- small-model fast path setup ----
     // Pre-compute VAF (alt fraction × 100) per position from the allele
@@ -493,8 +543,7 @@ fn make_examples_cmd(
     let height = opts.height;
     let center = (width / 2) as i64;
 
-    let mut writer = dv_io::tfrecord::open_writer(examples_path).context("open TFRecord")?;
-    let mut emitted = 0usize;
+    let emitted;
 
     // ---- Pass 1 (serial): small-model decisions + FASTA pre-fetch ----
     //
@@ -578,6 +627,8 @@ fn make_examples_cmd(
         }
     }
 
+    lap("pass1_small_model_decisions", &mut stage_t);
+
     // ---- Pass 2 (parallel): render images ----
     //
     // Each entry in `pending_renders` is independent — `owned` is shared
@@ -593,18 +644,13 @@ fn make_examples_cmd(
             const READ_OVERLAP_BUFFER_BP: i64 = 5;
             let query_start = p.variant.start - READ_OVERLAP_BUFFER_BP;
             let query_end = p.variant.end + READ_OVERLAP_BUFFER_BP;
-            let window_reads: Vec<&OwnedRead> = owned
+            // See realigner above for rationale. Binary-search the
+            // candidate slice, then filter by precomputed ref_end.
+            let lo = read_starts.partition_point(|&s| s + max_read_span <= query_start);
+            let hi = read_starts.partition_point(|&s| s < query_end);
+            let window_reads: Vec<&OwnedRead> = owned[lo..hi]
                 .iter()
-                .filter(|r| {
-                    let read_len_on_ref: i64 = r
-                        .cigar
-                        .iter()
-                        .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
-                        .map(|(_, l)| *l)
-                        .sum();
-                    let read_end = r.ref_start + read_len_on_ref;
-                    r.ref_start < query_end && read_end > query_start
-                })
+                .filter(|r| r.ref_end > query_start)
                 .collect();
             let alt_set: std::collections::HashSet<u8> = p
                 .variant
@@ -679,21 +725,25 @@ fn make_examples_cmd(
         })
         .collect();
 
-    // ---- Pass 3 (serial): write in canonical (input) order ----
+    lap("pass2_render_parallel", &mut stage_t);
+
+    // ---- Pass 3 (parallel-gzip): write in canonical (input) order ----
     //
     // par_iter preserves index order via `enumerate()`, but we explicitly
     // sort by index here to keep the output deterministic regardless of
-    // rayon's scheduling.
+    // rayon's scheduling. Then chunked-parallel-gzip the whole batch in
+    // one shot — the per-record streaming Writer was a single-thread
+    // bottleneck (~5 min on full chr20).
     let mut rendered = rendered;
     rendered.sort_by_key(|(idx, _)| *idx);
-    for (_, bytes) in rendered {
-        writer.write_record(&bytes)?;
-        emitted += 1;
-    }
-    writer.flush()?;
+    let payloads: Vec<Vec<u8>> = rendered.into_iter().map(|(_, bytes)| bytes).collect();
+    emitted = payloads.len();
+    dv_io::tfrecord::write_records_gz_parallel(examples_path, &payloads)
+        .context("write examples TFRecord")?;
     if let Some(mut w) = small_model_writer {
         w.flush()?;
     }
+    lap("pass3_write", &mut stage_t);
     tracing::info!(
         examples = emitted,
         small_model_cvos = small_model_emitted,
@@ -1284,17 +1334,27 @@ fn call_variants(
     let mut batch_rows: Vec<ExampleRow> = Vec::with_capacity(batch_size);
     let mut flat_buf: Vec<f32> = Vec::with_capacity(batch_size * PIXEL_BYTES);
 
+    // Stage time accumulators (across all batches).
+    let mut t_decode_us: u64 = 0;
+    let mut t_predict_us: u64 = 0;
+    let mut t_write_us: u64 = 0;
+
     let flush = |rows: &mut Vec<ExampleRow>,
                      buf: &mut Vec<f32>,
                      writer: &mut tfrecord::Writer<Box<dyn std::io::Write>>,
-                     total: &mut usize|
+                     total: &mut usize,
+                     t_predict_us: &mut u64,
+                     t_write_us: &mut u64|
      -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         let n = rows.len();
+        let t = std::time::Instant::now();
         let probs = model.predict_batch(buf, n)?;
+        *t_predict_us += t.elapsed().as_micros() as u64;
         anyhow::ensure!(probs.len() == n * 3);
+        let t = std::time::Instant::now();
         for (i, row) in rows.drain(..).enumerate() {
             let mut variant = row.variant;
             set_model_id(&mut variant, MODEL_ID);
@@ -1311,20 +1371,43 @@ fn call_variants(
             writer.write_record(&bytes)?;
             *total += 1;
         }
+        *t_write_us += t.elapsed().as_micros() as u64;
         buf.clear();
         Ok(())
     };
 
     while let Some(rec) = reader.read_record()? {
+        let t = std::time::Instant::now();
         let row = parse_example(&rec)?;
+        t_decode_us += t.elapsed().as_micros() as u64;
         flat_buf.extend_from_slice(&row.image_f32);
         batch_rows.push(row);
         if batch_rows.len() >= batch_size {
-            flush(&mut batch_rows, &mut flat_buf, &mut writer, &mut total)?;
+            flush(
+                &mut batch_rows,
+                &mut flat_buf,
+                &mut writer,
+                &mut total,
+                &mut t_predict_us,
+                &mut t_write_us,
+            )?;
         }
     }
-    flush(&mut batch_rows, &mut flat_buf, &mut writer, &mut total)?;
+    flush(
+        &mut batch_rows,
+        &mut flat_buf,
+        &mut writer,
+        &mut total,
+        &mut t_predict_us,
+        &mut t_write_us,
+    )?;
     writer.flush()?;
-    tracing::info!(total, "wrote CallVariantsOutput records");
+    tracing::info!(
+        total,
+        decode_ms = t_decode_us / 1000,
+        predict_ms = t_predict_us / 1000,
+        write_ms = t_write_us / 1000,
+        "wrote CallVariantsOutput records"
+    );
     Ok(())
 }

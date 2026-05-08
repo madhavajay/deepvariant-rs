@@ -24,10 +24,73 @@ pub struct OrtBackend {
 
 impl OrtBackend {
     pub fn load(onnx_path: impl AsRef<Path>) -> Result<Self, InferError> {
-        let session = Session::builder()
+        // ORT's default intra_threads (0 → all physical cores) is a
+        // fine baseline on Apple Silicon; forcing 12 + parallel exec
+        // mode regressed wall time on full chr20 due to thread
+        // oversubscription. Only the env-var overrides remain — leave
+        // them unset to keep ORT's defaults.
+        let mut builder = Session::builder()
             .map_err(|e| InferError::Backend(format!("ort builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| InferError::Backend(format!("opt level: {e}")))?
+            // Fixed-shape input → enable mem pattern (precomputes
+            // tensor allocation plan, skips repeated alloc work).
+            .with_memory_pattern(true)
+            .map_err(|e| InferError::Backend(format!("mem pattern: {e}")))?;
+        if let Ok(n) = std::env::var("DV_ORT_INTRA_THREADS").map(|s| s.parse::<usize>()) {
+            if let Ok(n) = n {
+                builder = builder
+                    .with_intra_threads(n)
+                    .map_err(|e| InferError::Backend(format!("intra threads: {e}")))?;
+            }
+        }
+        if let Ok(n) = std::env::var("DV_ORT_INTER_THREADS").map(|s| s.parse::<usize>()) {
+            if let Ok(n) = n {
+                builder = builder
+                    .with_inter_threads(n)
+                    .map_err(|e| InferError::Backend(format!("inter threads: {e}")))?;
+            }
+        }
+
+        // Apple platforms: register the CoreML EP. ORT will run nodes
+        // it supports on Metal GPU + Neural Engine + CPU and fall back
+        // to its CPU EP for unsupported nodes. Set DV_DISABLE_COREML=1
+        // to force pure CPU for A/B comparisons.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let coreml_off = std::env::var("DV_DISABLE_COREML")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !coreml_off {
+                use ort::ep::coreml::{ComputeUnits, ModelFormat, SpecializationStrategy};
+                use ort::ep::CoreML;
+                let ep = CoreML::default()
+                    // ALL = GPU + ANE + CPU; CoreML routes per-op.
+                    .with_compute_units(ComputeUnits::All)
+                    // NeuralNetwork (default) accepts our tf2onnx
+                    // export. MLProgram (newer, faster) fails to parse
+                    // the WGS Conv2D with "Required param 'pad' is
+                    // missing" — a known tf2onnx → MLProgram quirk.
+                    .with_model_format(ModelFormat::NeuralNetwork)
+                    // We run inference many times per session; trade
+                    // a slower first compile for faster predicts.
+                    .with_specialization_strategy(SpecializationStrategy::FastPrediction)
+                    .build();
+                // NOTE: the WGS ONNX export keeps the batch dim dynamic
+                // (`unk__980`). We *do not* call
+                // `with_static_input_shapes(true)` — that would tell
+                // CoreML to reject any node whose shape depends on the
+                // dynamic batch dim, dropping the entire graph back to
+                // the CPU EP and producing zero speedup. The default
+                // (accept dynamic shapes) lets CoreML run the rest.
+                builder = builder
+                    .with_execution_providers([ep])
+                    .map_err(|e| InferError::Backend(format!("CoreML EP: {e}")))?;
+            }
+        }
+
+        let session = builder
             .commit_from_file(onnx_path.as_ref())
             .map_err(|e| InferError::Backend(format!("load model: {e}")))?;
 

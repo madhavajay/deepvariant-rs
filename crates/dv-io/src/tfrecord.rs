@@ -144,16 +144,81 @@ pub fn open_reader(path: impl AsRef<Path>) -> io::Result<Reader<Box<dyn Read>>> 
 }
 
 /// Create a TFRecord file, transparently GZIP-wrapping `.gz` paths.
+///
+/// Uses `Compression::fast()` (level 1). TFRecord shards are
+/// intermediate artifacts — the wall-time cost of level 6 on big
+/// inputs is much larger than the on-disk savings (typically ~10%).
 pub fn open_writer(path: impl AsRef<Path>) -> io::Result<Writer<Box<dyn Write>>> {
     let path = path.as_ref();
     let file = File::create(path)?;
     let buf = BufWriter::new(file);
     let inner: Box<dyn Write> = if path.extension().and_then(|e| e.to_str()) == Some("gz") {
-        Box::new(GzEncoder::new(buf, Compression::default()))
+        Box::new(GzEncoder::new(buf, Compression::fast()))
     } else {
         Box::new(buf)
     };
     Ok(Writer::new(inner))
+}
+
+/// Write all records to a `.gz` (or plain) TFRecord file, chunking
+/// the records across rayon threads and concatenating the per-chunk
+/// gzip streams. Concatenated gzip streams are valid for any reader
+/// (this is how BGZF / pigz produce parallel output).
+///
+/// Use this when you have all records in memory at once (e.g.,
+/// make_examples Pass 3). For streaming writes prefer `Writer` +
+/// `write_record`.
+pub fn write_records_gz_parallel(
+    path: impl AsRef<Path>,
+    records: &[Vec<u8>],
+) -> io::Result<()> {
+    use rayon::prelude::*;
+    let path = path.as_ref();
+    let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
+
+    // One chunk per rayon worker; tweak if records are very small or
+    // very large. Bigger chunks → better gzip ratio + less per-chunk
+    // overhead; smaller chunks → better load balancing.
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_size = records.len().div_ceil(n_threads).max(1);
+
+    let blobs: Vec<Vec<u8>> = records
+        .par_chunks(chunk_size)
+        .map(|chunk| -> io::Result<Vec<u8>> {
+            let cap = chunk.iter().map(|r| r.len() + 16).sum::<usize>();
+            if is_gz {
+                let mut enc = GzEncoder::new(Vec::with_capacity(cap), Compression::fast());
+                for rec in chunk {
+                    write_framed(&mut enc, rec)?;
+                }
+                enc.finish()
+            } else {
+                let mut buf = Vec::with_capacity(cap);
+                for rec in chunk {
+                    write_framed(&mut buf, rec)?;
+                }
+                Ok(buf)
+            }
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut out = BufWriter::new(File::create(path)?);
+    for blob in blobs {
+        out.write_all(&blob)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn write_framed<W: Write>(out: &mut W, payload: &[u8]) -> io::Result<()> {
+    let len_buf = (payload.len() as u64).to_le_bytes();
+    let len_crc = mask(crc32c::crc32c(&len_buf));
+    let payload_crc = mask(crc32c::crc32c(payload));
+    out.write_all(&len_buf)?;
+    out.write_all(&len_crc.to_le_bytes())?;
+    out.write_all(payload)?;
+    out.write_all(&payload_crc.to_le_bytes())?;
+    Ok(())
 }
 
 enum ReadOutcome {
