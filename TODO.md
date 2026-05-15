@@ -157,10 +157,16 @@ Ordered by what unblocks the headline WGS number first.
   the fork's "95.7 % of windows already ≤8, no accuracy loss,
   INDEL slightly improved."
 
-- [ ] **[P2 — infra] Stable benchmark snapshot per commit.**
-  `~/deepvariant-benchmark/rust_runs_<git-sha>.json` hash-keyed
-  output so we can graph the perf journey over time and spot
-  regressions in CI.
+- [x] **[P2 — infra] Stable benchmark snapshot per commit.** Done.
+  `scripts/benchmark_rust.sh` now captures `git rev-parse --short
+  HEAD` (with a `-dirty` suffix when the tree is modified) and, in
+  addition to the rolling `benchmark_results.json`, writes an
+  immutable `$BENCH_DIR/rust_runs_<sha>.json` per commit. `git_sha`
+  and the actual `region` are recorded in the snapshot metadata so
+  the perf journey can be graphed over time / regression-checked in
+  CI. Clean commits get `rust_runs_<sha>.json`; dirty trees get
+  `rust_runs_<sha>-dirty.json` so a committed baseline is never
+  clobbered by an ad-hoc run.
 
 ## P0 — closes the last accuracy gap on chr20 quickstart
 

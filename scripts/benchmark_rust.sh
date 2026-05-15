@@ -45,6 +45,13 @@ export ORT_DYLIB_PATH
 CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
 PERF_CORES=$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || echo "?")
 
+# Git sha (+ -dirty suffix) so each run produces a stable, immutable
+# per-commit snapshot we can graph over time / regression-check in CI.
+GIT_SHA=$(git -C "$WORKSPACE_ROOT" rev-parse --short HEAD 2>/dev/null || echo "nogit")
+if ! git -C "$WORKSPACE_ROOT" diff --quiet HEAD -- 2>/dev/null; then
+    GIT_SHA="${GIT_SHA}-dirty"
+fi
+
 mkdir -p "$OUTPUT_DIR"
 RESULTS_JSONL="$OUTPUT_DIR/benchmark_runs.jsonl"
 RESULTS_JSON="$OUTPUT_DIR/benchmark_results.json"
@@ -115,10 +122,12 @@ for r in $(seq 1 "$NUM_RUNS"); do
     run_pipeline "$r"
 done
 
-# Aggregate.
-python3 - "$RESULTS_JSONL" "$RESULTS_JSON" "$CHIP" "$PERF_CORES" <<'PY'
+# Aggregate. Writes both the rolling `benchmark_results.json` and an
+# immutable per-commit snapshot `rust_runs_<sha>.json` under BENCH_DIR.
+SNAPSHOT_JSON="$BENCH_DIR/rust_runs_${GIT_SHA}.json"
+python3 - "$RESULTS_JSONL" "$RESULTS_JSON" "$CHIP" "$PERF_CORES" "$GIT_SHA" "$REGION" "$SNAPSHOT_JSON" <<'PY'
 import json, statistics, sys, datetime
-jsonl, out, chip, perf_cores = sys.argv[1:5]
+jsonl, out, chip, perf_cores, git_sha, region, snapshot = sys.argv[1:8]
 runs = [json.loads(l) for l in open(jsonl) if l.strip()]
 def stat(vals):
     return {
@@ -135,8 +144,9 @@ out_blob = {
         'binary': 'dv (Rust, release, ORT CPU)',
         'chip': chip,
         'perf_cores': int(perf_cores) if perf_cores.isdigit() else None,
+        'git_sha': git_sha,
         'sample': 'HG003',
-        'region': 'chr20',
+        'region': region,
         'shards': 1,
         'runs': len(runs),
         'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -146,6 +156,11 @@ out_blob = {
 }
 json.dump(out_blob, open(out, 'w'), indent=2)
 print(f'Wrote {out}')
+# Per-commit snapshot. Clean commits get `rust_runs_<sha>.json`;
+# uncommitted trees get `rust_runs_<sha>-dirty.json`, so a clean
+# baseline is never clobbered by an ad-hoc dirty run.
+json.dump(out_blob, open(snapshot, 'w'), indent=2)
+print(f'Wrote {snapshot}')
 PY
 
 echo
