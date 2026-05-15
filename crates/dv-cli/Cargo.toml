@@ -28,6 +28,7 @@ dv-core = { path = "../dv-core" }
 dv-io = { path = "../dv-io" }
 dv-infer = { path = "../dv-infer", default-features = false }
 dv-proto = { path = "../dv-proto" }
+tiny_http = "0.12"
 
 [dev-dependencies]
 prost.workspace = true

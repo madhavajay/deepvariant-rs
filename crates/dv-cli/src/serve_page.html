@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DeepVariant — dv serve</title>
+<style>
+  body { font: 14px/1.5 system-ui, -apple-system, sans-serif; max-width: 900px;
+         margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: .1em; }
+  h1 small { color: #666; font-weight: normal; font-size: .85rem; }
+  #drop { border: 2px dashed #bbb; border-radius: 10px; padding: 2.5em 1em;
+          text-align: center; color: #666; transition: .15s; cursor: pointer; }
+  #drop.over { border-color: #2a7ade; background: #eef5fd; color: #2a7ade; }
+  #drop.has { border-style: solid; border-color: #2a7a2a; color: #2a7a2a; }
+  .row { margin: 1em 0; display: flex; gap: .6em; align-items: center; }
+  label { font-weight: 600; }
+  input[type=text] { font: inherit; padding: .4em .5em; flex: 1;
+                     border: 1px solid #ccc; border-radius: 5px; }
+  button { font: inherit; padding: .5em 1.1em; border: 0; border-radius: 6px;
+           background: #2a7ade; color: #fff; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: default; }
+  #stages { display: flex; flex-wrap: wrap; gap: .4em; margin: 1em 0; }
+  .chip { font: 12px ui-monospace, Menlo, monospace; padding: .25em .6em;
+          border-radius: 999px; background: #eee; color: #555; }
+  .chip.done { background: #e3f3e3; color: #2a7a2a; }
+  .chip.now  { background: #fdebcf; color: #9a5a00; }
+  #log { font: 12px ui-monospace, Menlo, monospace; background: #1e1e1e;
+         color: #d4d4d4; padding: .8em; border-radius: 6px; height: 220px;
+         overflow: auto; white-space: pre-wrap; margin-top: 1em; }
+  #done { margin-top: 1em; font-size: 1.05rem; }
+  a.dl { display: inline-block; margin-top: .4em; padding: .5em 1em;
+         background: #2a7a2a; color: #fff; border-radius: 6px;
+         text-decoration: none; }
+</style>
+</head>
+<body>
+<h1>DeepVariant <small>— dv serve · drag a BAM/CRAM, watch it run</small></h1>
+<p>The browser is a thin client; the native <code>dv pipeline</code>
+runs server-side (so the CRAM fix, haplotype cap, and CoreML/MLProgram
+all apply) and streams stage progress here live.</p>
+
+<div id="drop">Drop a <b>.bam</b> / <b>.cram</b> here, or click to pick</div>
+<input id="file" type="file" accept=".bam,.cram" hidden>
+
+<div class="row">
+  <label for="region">Region</label>
+  <input id="region" type="text" value="chr22:20000000-25000000">
+  <button id="run" disabled>Run</button>
+</div>
+
+<div id="stages"></div>
+<div id="log">idle</div>
+<div id="done"></div>
+
+<script>
+const $drop = document.getElementById('drop');
+const $file = document.getElementById('file');
+const $region = document.getElementById('region');
+const $run = document.getElementById('run');
+const $log = document.getElementById('log');
+const $stages = document.getElementById('stages');
+const $done = document.getElementById('done');
+let picked = null;
+
+function setPicked(f) {
+  picked = f;
+  $drop.classList.add('has');
+  $drop.textContent = `✓ ${f.name} (${(f.size/1e6).toFixed(1)} MB) — ready`;
+  $run.disabled = false;
+}
+$drop.onclick = () => $file.click();
+$file.onchange = e => { if (e.target.files[0]) setPicked(e.target.files[0]); };
+['dragover','dragenter'].forEach(ev => $drop.addEventListener(ev, e => {
+  e.preventDefault(); $drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => $drop.addEventListener(ev, e => {
+  e.preventDefault(); $drop.classList.remove('over'); }));
+$drop.addEventListener('drop', e => {
+  if (e.dataTransfer.files[0]) setPicked(e.dataTransfer.files[0]); });
+
+function log(line) {
+  $log.textContent += (line + '\n');
+  $log.scrollTop = $log.scrollHeight;
+}
+const chips = {};
+function stage(name, ms) {
+  for (const k in chips) chips[k].className = 'chip done';
+  if (!chips[name]) {
+    const c = document.createElement('span');
+    c.className = 'chip now';
+    $stages.appendChild(c);
+    chips[name] = c;
+  }
+  chips[name].className = 'chip now';
+  chips[name].textContent = ms ? `${name} ${(ms/1000).toFixed(1)}s` : name;
+}
+
+$run.onclick = async () => {
+  if (!picked) return;
+  $run.disabled = true;
+  $log.textContent = '';
+  $stages.innerHTML = '';
+  $done.innerHTML = '';
+  for (const k in chips) delete chips[k];
+  const qs = `?name=${encodeURIComponent(picked.name)}` +
+             `&region=${encodeURIComponent($region.value.trim())}`;
+  log(`POST /run${qs}  (${(picked.size/1e6).toFixed(1)} MB upload…)`);
+  const t0 = Date.now();
+  let resp;
+  try {
+    resp = await fetch('/run' + qs, { method: 'POST', body: picked });
+  } catch (e) { log('ERROR ' + e); $run.disabled = false; return; }
+
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let tail = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    tail += dec.decode(value, { stream: true });
+    const lines = tail.split('\n');
+    tail = lines.pop();
+    for (const ln of lines) {
+      if (!ln) continue;
+      if (ln.startsWith('STAGE ')) {
+        const [, nm, ms] = ln.split(' ');
+        stage(nm, +ms || 0);
+        log(`· ${nm} ${ms ? (ms/1000).toFixed(1)+'s' : ''}`);
+      } else if (ln.startsWith('RESULT ')) {
+        const url = ln.slice(7).trim();
+        const secs = ((Date.now() - t0)/1000).toFixed(1);
+        for (const k in chips) chips[k].className = 'chip done';
+        $done.innerHTML =
+          `<b>Done in ${secs}s.</b><br>` +
+          `<a class="dl" href="${url}" download>⬇ download VCF</a>`;
+        log('RESULT ready: ' + url);
+      } else if (ln.startsWith('ERROR ')) {
+        log('❌ ' + ln);
+        $done.innerHTML = `<b style="color:#c33">${ln}</b>`;
+      } else {
+        log(ln.replace(/^LOG /, ''));
+      }
+    }
+  }
+  $run.disabled = false;
+};
+</script>
+</body>
+</html>

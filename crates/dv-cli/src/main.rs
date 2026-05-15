@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+mod serve;
 use prost::Message;
 
 use dv_core::postprocess::{self, PostprocessOptions};
@@ -142,6 +144,19 @@ enum Cmd {
         #[arg(long)]
         phase_reads: Option<PathBuf>,
     },
+    /// Serve a drag-and-drop web UI that runs `dv pipeline` on an
+    /// uploaded BAM/CRAM and streams stage progress to the browser.
+    Serve {
+        /// Reference FASTA (with `.fai`). Required for CRAM decode.
+        #[arg(long)]
+        ref_fasta: PathBuf,
+        /// SavedModel directory or `.onnx` checkpoint.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
 }
 
 fn main() -> Result<()> {
@@ -211,6 +226,11 @@ fn main() -> Result<()> {
             ref_fasta.as_deref(),
             phase_reads.as_deref(),
         ),
+        Cmd::Serve {
+            ref_fasta,
+            checkpoint,
+            port,
+        } => serve::serve_cmd(&ref_fasta, &checkpoint, port),
     }
 }
 
