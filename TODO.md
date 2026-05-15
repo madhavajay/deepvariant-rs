@@ -281,10 +281,23 @@ left:
   with a shared `for_each_record(&dyn Record, ...)` callback API. CRAM
   decompression goes through a `noodles::fasta::Repository` with an
   `IndexedReader` adapter for sequence reconstruction. `dv make-examples
-  --reads file.cram --ref-fasta ref.fasta` now works end-to-end. CRAM's
-  C-only deps (bzip2-sys, lzma-sys) are isolated to the `dv-io` crate's
-  local feature so `dv-core` and `dv-wasm` still build cleanly for
-  `wasm32-unknown-unknown`.
+  --reads file.cram --ref-fasta ref.fasta` works end-to-end on the
+  small test fixture. CRAM's C-only deps (bzip2-sys, lzma-sys) are
+  isolated to the `dv-io` crate's local feature so `dv-core` and
+  `dv-wasm` still build cleanly for `wasm32-unknown-unknown`.
+
+- [ ] **CRAM robustness — noodles-cram panics on real 1000G WGS
+  CRAMs.** `noodles-cram 0.78.0` panics decoding NA06985 (1000
+  Genomes, GRCh38) with `invalid reference base: "invalid
+  substitution base"` at `noodles-cram/src/record/sequence/iter.rs:119`,
+  on a CRAM that `samtools view -T <same ref>` decodes cleanly
+  (the @SQ M5 confirms our reference is the one the CRAM was built
+  against — it's a noodles decode-path limitation, not a data
+  mismatch). So the "CRAM support" above only covers the small
+  fixture, not arbitrary production CRAMs. Options: upgrade/patch
+  noodles-cram, or document the samtools CRAM→BAM transcode
+  workaround. Surfaced while trying to use a local WGS CRAM to
+  avoid a 100 GB BAM download.
 
 ## P4 — I/O polish
 
