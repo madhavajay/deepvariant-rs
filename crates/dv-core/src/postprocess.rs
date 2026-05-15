@@ -97,14 +97,26 @@ fn compare_cvos(a: &CallVariantsOutput, b: &CallVariantsOutput) -> Ordering {
     })
 }
 
-/// Group adjacent CVOs at the same variant range (after sort).
-/// Returns groups in input order; each inner Vec is one variant locus' CVOs.
+/// Group adjacent CVOs at the same variant range AND with the same canonical
+/// alt set (after sort). Returns groups in input order; each inner Vec is one
+/// variant locus' CVOs.
+///
+/// CVOs at the same `(ref_name, start, end)` but with **different** alt sets
+/// originate from different candidates (e.g. one from the allele counter and
+/// one from a realigner-assembled haplotype) and must NOT be grouped:
+/// `merge_predictions_multi` treats `cvos[0].variant.alternate_bases` as the
+/// canonical alt list shared by every CVO in the group, so mixing alt sets
+/// would cause `get_alt_alleles_to_remove` to insert / preserve the wrong
+/// alleles and `prune_alleles` to silently empty the alt list (n_alleles=1
+/// → assertion in `add_call_to_variant`).
 pub fn group_cvos(sorted: Vec<CallVariantsOutput>) -> Vec<Vec<CallVariantsOutput>> {
     let mut groups: Vec<Vec<CallVariantsOutput>> = Vec::new();
-    let mut cur_key: Option<(String, i64, i64)> = None;
+    let mut cur_key: Option<(String, i64, i64, Vec<String>)> = None;
     for cvo in sorted {
         let v = cvo.variant.as_ref().expect("variant");
-        let k = (v.reference_name.clone(), v.start, v.end);
+        let mut alts: Vec<String> = v.alternate_bases.clone();
+        alts.sort();
+        let k = (v.reference_name.clone(), v.start, v.end, alts);
         match &cur_key {
             Some(prev) if prev == &k => groups.last_mut().unwrap().push(cvo),
             _ => {
@@ -609,5 +621,65 @@ mod tests {
         let (idx, gt) = most_likely_genotype_diploid(&[0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 3);
         assert_eq!(idx, 5);
         assert_eq!(gt, [2, 2]);
+    }
+
+    /// Two distinct candidate variants at the same `(ref_name, start, end)`
+    /// but with **different** alt sets — e.g. one from the allele counter
+    /// (`alts=["A","G"]`) and one from a realigner-assembled deletion
+    /// (`alts=["G"]`) — must be processed as separate VCF records, not
+    /// merged. Pre-fix, `group_cvos` keyed only on the range and
+    /// `merge_predictions_multi` would silently empty the alt list, then
+    /// `add_call_to_variant` panicked with `n_alleles must be >= 2`.
+    /// Reproducer: full chr20 HG003 hit one such locus
+    /// (chr20:35167420-35167422 ref="GN").
+    #[test]
+    fn group_cvos_splits_distinct_alt_sets_at_same_range() {
+        use dv_proto::dv::call_variants_output::AltAlleleIndices;
+
+        fn cvo(alts: &[&str], aai: &[i32], probs: &[f64]) -> CallVariantsOutput {
+            CallVariantsOutput {
+                variant: Some(Variant {
+                    reference_name: "chr20".into(),
+                    start: 35_167_420,
+                    end: 35_167_422,
+                    reference_bases: "GN".into(),
+                    alternate_bases: alts.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                }),
+                alt_allele_indices: Some(AltAlleleIndices { indices: aai.to_vec() }),
+                genotype_probabilities: probs.to_vec(),
+                debug_info: None,
+            }
+        }
+        // Realigner-discovered deletion (1 alt) at the same range as a
+        // candidate-caller multi-allelic variant (2 alts). High-confidence
+        // hom-alt probs so the multi-allelic qual filter keeps both alts.
+        let cvos = vec![
+            cvo(&["A", "G"], &[0], &[0.001, 0.001, 0.998]), // multi-allelic, alt 0
+            cvo(&["A", "G"], &[1], &[0.001, 0.001, 0.998]), // multi-allelic, alt 1
+            cvo(&["G"],      &[0], &[0.001, 0.001, 0.998]), // realigner deletion
+        ];
+        let opts = PostprocessOptions::default();
+        // Pre-fix this would panic in add_call_to_variant
+        // ("n_alleles must be >= 2").
+        let variants = process_cvos_into_variants(cvos, "S1", &opts);
+        // Two records: the multi-allelic ["A","G"] candidate and the
+        // ["G"] deletion candidate, processed independently.
+        assert_eq!(variants.len(), 2, "got {} variants", variants.len());
+        let mut alt_sets: Vec<Vec<String>> =
+            variants.iter().map(|v| v.alternate_bases.clone()).collect();
+        alt_sets.sort();
+        assert_eq!(
+            alt_sets,
+            vec![
+                vec!["A".to_string(), "G".to_string()],
+                vec!["G".to_string()],
+            ],
+            "expected the 2-alt and 1-alt candidates as separate records"
+        );
+        // No 0-alt record slipped through.
+        for v in &variants {
+            assert!(!v.alternate_bases.is_empty(), "0-alt record");
+        }
     }
 }

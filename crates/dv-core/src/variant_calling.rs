@@ -178,6 +178,27 @@ pub fn candidates_from_counts(
         // Sort alts deterministically for a stable output.
         passing_alts.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
 
+        // Collapse alts that project to the same alt base string. Two
+        // distinct `(allele_type, bases)` keys (e.g. an insertion and a
+        // substitution) can yield the same alt string; emitting it twice
+        // produces a malformed multi-allelic Variant
+        // (`alternate_bases = ["GT", "GT"]`). Downstream that breaks the
+        // postprocess merge: `to_remove` is a HashSet so it dedupes the
+        // string, the `to_remove.len() == alternate_bases.len()` safety
+        // net misfires, and `prune_alleles` strips *both* copies, leaving
+        // a 0-alt variant → `n_alleles must be >= 2` panic. Sum the read
+        // counts for collapsed alts so AD/VAF stay consistent.
+        {
+            let mut deduped: Vec<(i32, String, i32)> = Vec::with_capacity(passing_alts.len());
+            for (t, b, cnt) in passing_alts.drain(..) {
+                match deduped.iter_mut().find(|(_, eb, _)| *eb == b) {
+                    Some((_, _, ec)) => *ec += cnt,
+                    None => deduped.push((t, b, cnt)),
+                }
+            }
+            passing_alts = deduped;
+        }
+
         let pos = c.position.as_ref().expect("position");
         let ref_len = if passing_alts
             .iter()
@@ -599,5 +620,61 @@ mod tests {
         let alts = &snp.unwrap().alternate_bases;
         assert!(alts.iter().any(|a| a == "C"), "missing SNP alt C");
         assert!(alts.iter().any(|a| a.len() == 3), "missing INS alt ACC-like");
+    }
+
+    /// Two distinct `(allele_type, bases)` keys with the SAME base string
+    /// (e.g. an insertion and a substitution that both spell "GT") must
+    /// collapse to a single alt — `alternate_bases` must never contain a
+    /// duplicate, and AD must sum the collapsed reads. Pre-fix this
+    /// produced `["GT","GT"]`, which made postprocess emit a 0-alt
+    /// variant and panic (`n_alleles must be >= 2`). Real-data repro:
+    /// chr20:35167420 ref="GN" on full-chr20 HG003.
+    #[test]
+    fn duplicate_alt_string_is_collapsed() {
+        use dv_proto::nucleus_v1::Position;
+
+        let mut read_alleles = std::collections::BTreeMap::new();
+        for i in 0..4 {
+            read_alleles.insert(
+                format!("ins{i}/1"),
+                Allele { bases: "GT".into(), r#type: AlleleType::Insertion as i32, count: 1, ..Default::default() },
+            );
+        }
+        for i in 0..4 {
+            read_alleles.insert(
+                format!("sub{i}/1"),
+                Allele { bases: "GT".into(), r#type: AlleleType::Substitution as i32, count: 1, ..Default::default() },
+            );
+        }
+        let ac = AlleleCount {
+            position: Some(Position {
+                reference_name: "chr20".into(),
+                position: 35_167_420,
+                ..Default::default()
+            }),
+            ref_base: "G".into(),
+            ref_supporting_read_count: 4,
+            read_alleles,
+            ..Default::default()
+        };
+        let cs = candidates_from_counts(&[ac], &VariantCallerOptions::default());
+        assert_eq!(cs.len(), 1, "expected one candidate");
+        let v = &cs[0];
+        assert_eq!(
+            v.alternate_bases,
+            vec!["GT".to_string()],
+            "duplicate alt not collapsed: {:?}",
+            v.alternate_bases
+        );
+        // AD = [ref, collapsed-alt] = [4, 4+4].
+        let ad = &v.calls[0].info["AD"].values;
+        let ad_ints: Vec<i64> = ad
+            .iter()
+            .filter_map(|x| match &x.kind {
+                Some(value::Kind::IntValue(n)) => Some(*n as i64),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ad_ints, vec![4, 8], "AD not summed across collapsed alts");
     }
 }

@@ -82,32 +82,63 @@ Smoke (1 Mbp slice, 2879 examples), inference only:
 
 ### Outstanding — finishing the perf pass
 
-- [ ] **Lock in MLProgram + batch-pinning on full chr20.** The
-  pinned-batch + zero-pad code is live in `dv pipeline` and `dv
-  call-variants`, and the smoke bench confirms ~3× inference
-  speedup, but the full-chr20 `dv pipeline` wall hasn't been
-  re-measured since the change. Re-run with the regenerated
-  `models/wgs/model.onnx` (batch=128, explicit pads) and update
-  `benchmark.md`. Projected: pass2_render_streamed 125 s → ~50 s,
-  end-to-end chr20 ~1 m 30 s, WGS ~1 h 15 m.
-- [ ] **Run the full WGS end-to-end on this M2 Max.** Per-chromosome
-  dispatch (24 `dv pipeline` invocations, concat CVOs through `dv
-  postprocess-variants`). Blocked on the postprocess panic below.
-  Once unblocked, this is the headline reproducibility number to
-  publish.
-- [ ] **Postprocess panic on full chr20.** `add_call_to_variant`
-  panics with `assertion failed: n_alleles must be >= 2` when fed
-  the full-chr20 CVO. Reproduces from both the ME+CV pipeline and
-  `dv pipeline` outputs → pre-existing candidate / regrouping bug,
-  not introduced by the perf work. Blocks emitting a complete WGS
-  VCF.
-- [ ] **Haplotype cap (≤8 candidates per DBG)** in the realigner —
-  portable optimisation from the C++ fork, claimed −14.7 % on
-  make_examples. We already parallelised the loop, so the cap is
-  pure CPU-cycle savings.
-- [ ] **Stable benchmark snapshot per commit.** `~/deepvariant-benchmark/rust_runs_<git-sha>.json`
-  hash-keyed output so we can graph the perf journey over time and
-  spot regressions in CI.
+Ordered by what unblocks the headline WGS number first.
+
+- [x] **[P0 — blocker] Postprocess panic on full chr20.** Fixed.
+  Root cause: at chr20:35167420 the candidate caller emitted a
+  malformed variant with a **duplicate alt** (`alternate_bases =
+  ["GT","GT"]`) — two distinct `(allele_type, bases)` allele-counter
+  keys projecting to the same alt string. Downstream, `to_remove`
+  in `get_alt_alleles_to_remove` is a `HashSet` so it dedupes the
+  string; the `to_remove.len() == alternate_bases.len()` safety net
+  then misfires (1 ≠ 2) and `prune_alleles` strips *both* copies,
+  leaving a 0-alt variant → `n_alleles must be >= 2`.
+  Fixes (both landed):
+  1. **Source:** `variant_calling::candidates_from_counts` now
+     collapses alts that project to the same base string, summing
+     their read counts so AD/VAF stay consistent. A candidate can
+     no longer carry a duplicate alt.
+  2. **Defensive:** `postprocess::group_cvos` now keys on
+     `(ref_name, start, end, sorted_alts)` instead of just the
+     range, so two *different* candidates at the same range (e.g.
+     an allele-counter SNV/INS and a realigner-assembled deletion)
+     are processed as separate VCF records rather than merged with
+     a mismatched canonical alt list.
+  Regression tests:
+  `variant_calling::tests::duplicate_alt_string_is_collapsed` and
+  `postprocess::tests::group_cvos_splits_distinct_alt_sets_at_same_range`.
+  Verified end-to-end: full-chr20 `dv pipeline` (208,882 CVOs) →
+  `dv postprocess-variants` exits 0, emits 205,198 VCF records, the
+  chr20:35167421 locus now produces two valid records
+  (`G→GT` insertion + `GT→G` deletion), zero duplicate-alt records
+  across the whole VCF.
+
+- [ ] **[P1 — measurement] Lock in MLProgram + batch-pinning on
+  full chr20.** The pinned-batch + zero-pad code is live in `dv
+  pipeline` and `dv call-variants`, and the smoke bench confirms
+  ~3× inference speedup, but the full-chr20 `dv pipeline` wall
+  hasn't been re-measured since the change. Re-run
+  `./benchmark.sh --full` with the regenerated `models/wgs/model.onnx`
+  (batch=128, explicit pads) and update `benchmark.md`. Projected:
+  pass2_render_streamed 125 s → ~50 s, end-to-end chr20 ~1 m 30 s,
+  WGS ~1 h 15 m. Independent of the panic above — worth doing
+  before or after, doesn't matter, as long as it lands.
+
+- [ ] **[P1 — headline number] Run the full WGS end-to-end on this
+  M2 Max.** Per-chromosome dispatch (24 `dv pipeline` invocations,
+  concat CVOs through `dv postprocess-variants`). Blocked on the
+  postprocess panic above. Once unblocked, this is the
+  reproducibility number to publish.
+
+- [ ] **[P2 — perf, portable] Haplotype cap (≤8 candidates per
+  DBG)** in the realigner — portable optimisation from the C++
+  fork, claimed −14.7 % on make_examples. We already parallelised
+  the loop, so the cap is pure CPU-cycle savings.
+
+- [ ] **[P2 — infra] Stable benchmark snapshot per commit.**
+  `~/deepvariant-benchmark/rust_runs_<git-sha>.json` hash-keyed
+  output so we can graph the perf journey over time and spot
+  regressions in CI.
 
 ## P0 — closes the last accuracy gap on chr20 quickstart
 
