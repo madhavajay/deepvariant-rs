@@ -113,22 +113,35 @@ Ordered by what unblocks the headline WGS number first.
   (`G→GT` insertion + `GT→G` deletion), zero duplicate-alt records
   across the whole VCF.
 
-- [ ] **[P1 — measurement] Lock in MLProgram + batch-pinning on
-  full chr20.** The pinned-batch + zero-pad code is live in `dv
-  pipeline` and `dv call-variants`, and the smoke bench confirms
-  ~3× inference speedup, but the full-chr20 `dv pipeline` wall
-  hasn't been re-measured since the change. Re-run
-  `./benchmark.sh --full` with the regenerated `models/wgs/model.onnx`
-  (batch=128, explicit pads) and update `benchmark.md`. Projected:
-  pass2_render_streamed 125 s → ~50 s, end-to-end chr20 ~1 m 30 s,
-  WGS ~1 h 15 m. Independent of the panic above — worth doing
-  before or after, doesn't matter, as long as it lands.
+- [x] **[P1 — measurement] Lock in MLProgram + batch-pinning on
+  full chr20.** Measured (clean, uncontended, M2 Max,
+  `models/wgs/model.onnx` batch=128 + explicit pads, 208,882 CVOs):
+  `pass2_render_streamed` 124.8 s → **106.2 s**, pipeline wall
+  2 m 55 s → **~2 m 34 s**, postprocess **1.4 s**, end-to-end
+  **~2 m 35 s** (~17 % faster than the C++ fork's 3 m 06 s).
+  The earlier "pass2 → ~50 s, e2e ~1 m 30 s" projection was wrong:
+  the 3× the inference smoke bench showed does NOT translate,
+  because `pass2_render_streamed` overlaps CPU rendering with
+  GPU/ANE inference and is **render-bound** at full-chr20 scale —
+  faster inference only trims the inference-was-long-pole slice.
+  The new long pole is the renderer (106 s). `benchmark.md`
+  updated with measured numbers + the honest note.
 
 - [ ] **[P1 — headline number] Run the full WGS end-to-end on this
   M2 Max.** Per-chromosome dispatch (24 `dv pipeline` invocations,
-  concat CVOs through `dv postprocess-variants`). Blocked on the
-  postprocess panic above. Once unblocked, this is the
-  reproducibility number to publish.
+  concat CVOs through `dv postprocess-variants`). Postprocess panic
+  unblocked, but **now blocked on data**: the local benchmark set
+  is chr20-only
+  (`HG003.novaseq.pcr-free.35x.dedup.grch38_no_alt.chr20.bam`).
+  A real WGS run needs the whole-genome HG003 BAM (~100 GB+),
+  not yet downloaded. WGS numbers in `benchmark.md` remain a
+  linear projection (~2 h 04 m), not measured.
+
+- [ ] **[P1 — new long pole] Speed up `pass2_render_streamed`
+  (106 s).** Now the dominant stage. Candidates: SIMD pileup
+  encode, fewer per-pixel allocations in the channel encoders,
+  coarser-grained rayon batching to cut task overhead. The model
+  backend is no longer the bottleneck here.
 
 - [ ] **[P2 — perf, portable] Haplotype cap (≤8 candidates per
   DBG)** in the realigner — portable optimisation from the C++

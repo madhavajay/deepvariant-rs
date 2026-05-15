@@ -135,16 +135,34 @@ to the merged owned list exactly once.
 
 Stage breakdown for full chr20 (M2 Max, CoreML enabled):
 
-| Stage | sequential pre-pass2 | sharded pre-pass2 |
-|---|---|---|
-| bam_read + allele_counter | 29.5 s + 7.7 s | **7.0 s** (12 shards in parallel) |
-| bam_sort | 0.2 s | 0.3 s |
-| candidate_caller | 3.3 s | 3.5 s |
-| realigner | 48.5 s | 32.8 s |
-| pass1_prepare_renders | 0.6 s | 0.4 s |
-| **pass2_render_streamed** (overlapped with inference) | 125.9 s | 124.8 s |
-| inference_drain (final batch flush after pass2 done) | 1.8 s | 1.6 s |
-| **wall total** | **3 m 45 s** | **2 m 55 s** |
+| Stage | sequential pre-pass2 | sharded pre-pass2 | sharded + MLProgram batch=128 |
+|---|---|---|---|
+| bam_read + allele_counter | 29.5 s + 7.7 s | 7.0 s (12 shards in parallel) | **8.4 s** |
+| bam_sort | 0.2 s | 0.3 s | 0.3 s |
+| candidate_caller | 3.3 s | 3.5 s | 2.8 s |
+| realigner | 48.5 s | 32.8 s | 35.9 s |
+| pass1_prepare_renders | 0.6 s | 0.4 s | 0.4 s |
+| **pass2_render_streamed** (overlapped with inference) | 125.9 s | 124.8 s | **106.2 s** |
+| inference_drain (final batch flush after pass2 done) | 1.8 s | 1.6 s | 0.2 s |
+| **wall total** | **3 m 45 s** | **2 m 55 s** | **~2 m 34 s** |
+
+Measured on the regenerated `models/wgs/model.onnx` (batch dim
+pinned to 128 by `scripts/normalize_onnx_pads.py`, explicit Conv
+pads, MLProgram-safe) with 208,882 CVOs emitted.
+
+**Honest note on the MLProgram batch-pinning win.** The 1 Mbp
+inference-only smoke bench showed a ~3× speedup (4.1 s → 1.3 s,
+NeuralNetwork dynamic-batch → MLProgram batch=128). That does
+**not** translate to a 3× drop in `pass2_render_streamed` at full
+chr20: it fell 124.8 s → 106.2 s (≈15 %), not → ~50 s as earlier
+projected. Reason: `pass2_render_streamed` overlaps pileup-image
+rendering (CPU, rayon) with inference (GPU+ANE) through the bounded
+channel. At full-chr20 scale rendering is the bottleneck, so faster
+inference only shaves the portion of wall time where inference was
+the long pole. The smoke bench isolated inference, so it saw the
+full backend speedup; the streamed pipeline is render-bound. The
+next pass2 win has to come from the renderer, not the model
+backend.
 
 ### Side-by-side end-to-end (HG003 chr20, M2 Max)
 
@@ -153,17 +171,23 @@ Stage breakdown for full chr20 (M2 Max, CoreML enabled):
 | Rust port — original baseline | (>40 min, never finished) | (~25 min projected) | — | (never measured) |
 | Rust port — sequential (CoreML, ME→file→CV) | 133 s | 143 s | ~10 s | ~286 s (4 m 46 s) |
 | Rust port — `dv pipeline` (concurrent, sequential pre-pass2) | concurrent | concurrent | ~10 s pending | ~225 s (3 m 45 s) |
-| **Rust port — `dv pipeline` w/ sharded pre-pass2** | **concurrent** | **concurrent** | **~10 s** | **175 s (2 m 55 s)** |
+| Rust port — `dv pipeline` w/ sharded pre-pass2 (NeuralNetwork) | concurrent | concurrent | ~10 s | 175 s (2 m 55 s) |
+| **Rust port — `dv pipeline` sharded + MLProgram batch=128** | **concurrent** | **concurrent** | **1.4 s** | **~155 s (2 m 35 s)** |
 | C++ fork — sequential Metal+CoreML (M1 Max published) | 263 s | 175 s | 16 s | 454 s (7 m 34 s) |
 | C++ fork — fast-pipeline Metal+CoreML (M2 Max measured) | concurrent | concurrent | 16 s | 186 s (3 m 06 s) |
 
-**Rust `dv pipeline` is now 6% faster than the C++ Metal+CoreML
-fast-pipeline on the same machine** (2 m 55 s vs 3 m 06 s),
+`postprocess` is 1.4 s for the full-chr20 CVO (205,198 VCF
+records) without `--phase-reads`; the earlier "~10 s" was a
+pre-measurement placeholder.
+
+**Rust `dv pipeline` is ~17 % faster than the C++ Metal+CoreML
+fast-pipeline on the same machine** (2 m 35 s vs 3 m 06 s),
 single-process, no GNU `parallel`, no shared-memory IPC. The win
 relative to C++ comes mostly from the sorted-read overlap index +
 parallel-chunked gzip + single-process channel coordination
 overhead being lower than the C++ fork's 8-shard `make_examples` +
-shared-memory bridge.
+shared-memory bridge, plus the MLProgram batch=128 pinning shaving
+~20 s off `pass2_render_streamed`.
 
 ### Full WGS (chr1–chr22, X, Y) projection on this M2 Max
 
@@ -171,8 +195,9 @@ Linear scaling from chr20 (64.4 Mbp / 3088 Mbp full genome ≈ 48×):
 
 | Configuration | chr20 measured | WGS projected |
 |---|---|---|
-| **Rust `dv pipeline` (sharded, BAM)** | 2 m 55 s | **~2 h 20 m** |
-| Rust `dv pipeline` (sharded, CRAM, indexed `.crai`) | est. +10 % | ~2 h 35 m |
+| **Rust `dv pipeline` (sharded + MLProgram batch=128, BAM)** | 2 m 35 s | **~2 h 04 m** |
+| Rust `dv pipeline` (sharded, BAM, NeuralNetwork) | 2 m 55 s | ~2 h 20 m |
+| Rust `dv pipeline` (sharded, CRAM, indexed `.crai`) | est. +10 % | ~2 h 17 m |
 | C++ Metal+CoreML+fast-pipeline (M2 Max) | 3 m 06 s | ~2 h 30 m |
 | C++ Metal+CoreML+fast-pipeline (M1 Max, fork README) | 3 m 21 s | ~3 h (published) |
 | C++ stock GCP n2-standard-96 (96 vCPU CPU-only) | 1 m 39 s | 1 h 19 m |
@@ -185,11 +210,18 @@ shards through `dv postprocess-variants`. chr1 is ~5× chr20 in
 length; at 35× depth it needs ~50 GB peak RAM during the merged
 owned-reads phase — fits on a 64 GB M2 Max.
 
+**Not yet measured end-to-end:** the local benchmark dataset is
+chr20-only (`HG003.novaseq.pcr-free.35x.dedup.grch38_no_alt.chr20.bam`).
+A real WGS run needs the whole-genome HG003 BAM (~100 GB+), not
+yet downloaded. The WGS column above is a linear projection from
+the measured chr20 wall, not a measured number.
+
 ### Remaining
 
 | Target | Est. wall savings on full chr20 | Notes |
 |---|---|---|
-| `MLProgram` CoreML format (re-export ONNX with explicit Conv pad to fix the tf2onnx → MLProgram parse error) | likely 1.2–1.5× on inference (drops pass2_render_streamed) | macOS/iOS only. |
+| ~~`MLProgram` CoreML format~~ — **landed**, batch=128 pinned | measured: 124.8 s → 106.2 s on pass2 (~20 s wall) | macOS/iOS only. Smaller than the 1.2–1.5× projected — pass2 is render-bound, not inference-bound, at full scale. |
+| Renderer speedup for `pass2_render_streamed` (now the dominant stage at 106 s) | unknown; this is the new long pole | SIMD pileup encode / fewer per-pixel allocations / batch the rayon map. |
 | Per-window haplotype cap (≤8 haplotypes per DBG) — the C++ fork's portable optimization | ~5 s on realigner | Portable, also reduces noisy assembly windows. |
 | Realigner DBG SIMD/optimized hashing | ~10 s on realigner | Portable. |
 | Multi-threaded BGZF write for the CVO output | small (~1–2 s, write is already minor) | Portable. |
@@ -197,11 +229,16 @@ owned-reads phase — fits on a 64 GB M2 Max.
 
 ### Known issues
 
-- **`postprocess-variants` panics on full chr20**: assertion
-  `n_alleles must be >= 2` in `add_call_to_variant`. Reproducible from
-  both the ME+CV path and the pipeline path, so it's a pre-existing
-  candidate / regrouping bug, **not introduced by the pipeline**.
-  Tracked.
+- ~~**`postprocess-variants` panics on full chr20**: assertion
+  `n_alleles must be >= 2` in `add_call_to_variant`.~~ **Fixed.**
+  Root cause: the candidate caller emitted a duplicate alt
+  (`alternate_bases = ["GT","GT"]`) at chr20:35167420; the
+  HashSet-based `to_remove` deduped it and the prune safety net
+  misfired, leaving a 0-alt variant. Fixed at the source
+  (`variant_calling::candidates_from_counts` collapses alts that
+  project to the same string, summing counts) plus a defensive
+  `group_cvos` split by `(range, sorted_alts)`. Full-chr20 now
+  emits 205,198 VCF records cleanly. See `TODO.md`.
 
 ## Validation
 
