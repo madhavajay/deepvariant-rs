@@ -1,0 +1,63 @@
+[package]
+name = "noodles-cram"
+version = "0.78.0"
+authors = ["Michael Macias <zaeleus@gmail.com>"]
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "CRAM format reader and writer"
+homepage = "https://github.com/zaeleus/noodles"
+repository = "https://github.com/zaeleus/noodles"
+documentation = "https://docs.rs/noodles-cram"
+
+[features]
+async = ["dep:async-compression", "dep:futures", "dep:pin-project-lite", "dep:tokio"]
+libdeflate = ["dep:libdeflater"]
+
+[dependencies]
+bitflags.workspace = true
+bstr.workspace = true
+byteorder.workspace = true
+bzip2 = "0.5.0"
+flate2.workspace = true
+indexmap.workspace = true
+md-5 = "0.10.0"
+noodles-bam = { path = "../noodles-bam", version = "0.76.0" }
+noodles-core = { path = "../noodles-core", version = "0.16.0" }
+noodles-fasta = { path = "../noodles-fasta", version = "0.49.0" }
+noodles-sam = { path = "../noodles-sam", version = "0.72.0" }
+xz2 = "0.1.6"
+
+async-compression = { version = "0.4.0", optional = true, features = ["gzip", "tokio"] }
+futures = { workspace = true, optional = true, features = ["std"] }
+pin-project-lite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["fs", "io-util"] }
+
+libdeflater = { workspace = true, optional = true }
+
+[dev-dependencies]
+noodles-sam = { path = "../noodles-sam", version = "0.72.0", features = ["async"] }
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+features = ["async"]
+
+[[example]]
+name = "cram_count_async"
+required-features = ["async"]
+
+[[example]]
+name = "cram_query_async"
+required-features = ["async"]
+
+[[example]]
+name = "cram_read_header_async"
+required-features = ["async"]
+
+[[example]]
+name = "cram_view_async"
+required-features = ["async"]
+
+[[example]]
+name = "cram_write_async"
+required-features = ["async"]

@@ -1384,8 +1384,6 @@ dependencies = [
 [[package]]
 name = "noodles-cram"
 version = "0.78.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04c50001609e3f901d35e08bffa245108220f099929ca1ce01a2ef5cb88850a4"
 dependencies = [
  "bitflags",
  "bstr",

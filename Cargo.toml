@@ -41,3 +41,13 @@ tensorflow = "0.21"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Vendored noodles-cram 0.78.0 with a single upstream-matching fix:
+# `Base::try_from(ref_base).unwrap_or(Base::N)` instead of `.expect()`,
+# so a non-ACGTN reference base (IUPAC codes in GRCh38 decoy/HLA, or
+# N in gaps) under a CRAM Substitution feature falls back to N
+# instead of panicking. This is exactly what noodles-cram 0.93.0
+# does; we patch 0.78.0 in place to avoid a wide meta-crate bump.
+# See third_party/noodles-cram/src/record/sequence/iter.rs.
+[patch.crates-io]
+noodles-cram = { path = "third_party/noodles-cram" }

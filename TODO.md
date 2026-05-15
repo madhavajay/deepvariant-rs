@@ -286,18 +286,24 @@ left:
   isolated to the `dv-io` crate's local feature so `dv-core` and
   `dv-wasm` still build cleanly for `wasm32-unknown-unknown`.
 
-- [ ] **CRAM robustness — noodles-cram panics on real 1000G WGS
-  CRAMs.** `noodles-cram 0.78.0` panics decoding NA06985 (1000
-  Genomes, GRCh38) with `invalid reference base: "invalid
-  substitution base"` at `noodles-cram/src/record/sequence/iter.rs:119`,
-  on a CRAM that `samtools view -T <same ref>` decodes cleanly
-  (the @SQ M5 confirms our reference is the one the CRAM was built
-  against — it's a noodles decode-path limitation, not a data
-  mismatch). So the "CRAM support" above only covers the small
-  fixture, not arbitrary production CRAMs. Options: upgrade/patch
-  noodles-cram, or document the samtools CRAM→BAM transcode
-  workaround. Surfaced while trying to use a local WGS CRAM to
-  avoid a 100 GB BAM download.
+- [x] **CRAM robustness — noodles-cram panic on real WGS CRAMs.**
+  Fixed. `noodles-cram 0.78.0` `.expect("invalid reference base")`'d
+  at `record/sequence/iter.rs:118` whenever a read carried a
+  Substitution feature over a non-ACGTN reference base — IUPAC
+  ambiguity codes in GRCh38 decoy/HLA, or N in gaps (its
+  `Base::try_from` only accepts A/C/G/T/N). samtools/htslib reads
+  the same file fine. Fixed by vendoring noodles-cram 0.78.0 to
+  `third_party/noodles-cram/` and applying the **exact upstream
+  0.93.0 change** — `Base::try_from(ref).unwrap_or(Base::N)` — via
+  `[patch.crates-io]` (one functional line; avoids a wide
+  meta-crate bump since 0.93 also changed internal APIs).
+  Validated: `dv pipeline` directly on the NA06985 chr22 CRAM now
+  exits 0 and the resulting VCF is **byte-identical** to the
+  samtools-transcode→BAM path (134,610 records, `diff` exit 0).
+  CRAM-direct chr22 wall 141 s vs BAM 113 s — CRAM trades ~28 s of
+  reference-reconstruction CPU for needing no extra disk (the
+  read-decode `shard_pre_pass2` stage went 5 s → 48 s; everything
+  downstream is identical).
 
 ## P4 — I/O polish
 
