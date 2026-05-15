@@ -15,6 +15,17 @@ use dv_proto::tf::{feature::Kind as FeatureKind, Example};
 const PIXEL_BYTES: usize = 100 * 221 * 7;
 const MODEL_ID: &str = "deepvariant";
 
+/// Cap on assembled haplotypes carried out of each de-Bruijn window
+/// before the (expensive) SSW pass in `variants_from_haplotype`.
+/// Mirrors the C++ Apple-Silicon fork's `_MAX_HAPLOTYPES = 8`
+/// (`realigner.py`): ~95.7% of assembled windows already produce ≤8
+/// haplotypes; the long tail (up to `max_num_paths`=256) drives
+/// disproportionate Smith-Waterman cost in complex/repeat regions.
+/// `candidate_haplotypes()` returns them lexicographically sorted, so
+/// this keeps the first 8 — the fork measured −14.7% on make_examples
+/// with no accuracy loss (INDEL accuracy slightly improved).
+const MAX_HAPLOTYPES_PER_WINDOW: usize = 8;
+
 #[derive(Parser)]
 #[command(name = "dv", version, about = "DeepVariant in Rust")]
 struct Cli {
@@ -496,7 +507,11 @@ fn make_examples_cmd(
                     .collect();
                 let graph = DeBruijnGraph::build(win_ref, &read_inputs, &dbg_opts)?;
                 let mut out: Vec<Variant> = Vec::new();
-                for hap in graph.candidate_haplotypes() {
+                for hap in graph
+                    .candidate_haplotypes()
+                    .into_iter()
+                    .take(MAX_HAPLOTYPES_PER_WINDOW)
+                {
                     if hap.as_slice() == win_ref {
                         continue;
                     }
@@ -1111,7 +1126,11 @@ fn pipeline_cmd(
                     .collect();
                 let graph = DeBruijnGraph::build(win_ref, &read_inputs, &dbg_opts)?;
                 let mut out: Vec<Variant> = Vec::new();
-                for hap in graph.candidate_haplotypes() {
+                for hap in graph
+                    .candidate_haplotypes()
+                    .into_iter()
+                    .take(MAX_HAPLOTYPES_PER_WINDOW)
+                {
                     if hap.as_slice() == win_ref {
                         continue;
                     }

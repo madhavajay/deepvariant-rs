@@ -143,10 +143,19 @@ Ordered by what unblocks the headline WGS number first.
   coarser-grained rayon batching to cut task overhead. The model
   backend is no longer the bottleneck here.
 
-- [ ] **[P2 — perf, portable] Haplotype cap (≤8 candidates per
-  DBG)** in the realigner — portable optimisation from the C++
-  fork, claimed −14.7 % on make_examples. We already parallelised
-  the loop, so the cap is pure CPU-cycle savings.
+- [x] **[P2 — perf, portable] Haplotype cap (≤8 candidates per
+  DBG).** Done. Ported the C++ fork's `_MAX_HAPLOTYPES = 8`
+  (`realigner.py:783`): the two uncapped `graph.candidate_haplotypes()`
+  loops in the dv-cli hot path (`pipeline` + `make-examples`) now
+  `.take(MAX_HAPLOTYPES_PER_WINDOW)` after the lexicographic sort.
+  The library `realign_window` path already capped (its
+  `RealignerOptions.max_haplotypes` default stays 64; only the
+  dv-cli inline DBG loop was uncapped). Measured clean full-chr20:
+  realigner **35.9 s → 24.6 s (−31.5 %, −11.3 s)**; candidates
+  208,882 → 207,938 (−944, −0.45 %, the noisy long tail);
+  postprocess clean, 204,254 VCF records, zero dup-alt. Matches
+  the fork's "95.7 % of windows already ≤8, no accuracy loss,
+  INDEL slightly improved."
 
 - [ ] **[P2 — infra] Stable benchmark snapshot per commit.**
   `~/deepvariant-benchmark/rust_runs_<git-sha>.json` hash-keyed

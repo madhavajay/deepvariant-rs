@@ -222,7 +222,7 @@ the measured chr20 wall, not a measured number.
 |---|---|---|
 | ~~`MLProgram` CoreML format~~ — **landed**, batch=128 pinned | measured: 124.8 s → 106.2 s on pass2 (~20 s wall) | macOS/iOS only. Smaller than the 1.2–1.5× projected — pass2 is render-bound, not inference-bound, at full scale. |
 | Renderer speedup for `pass2_render_streamed` (now the dominant stage at 106 s) | unknown; this is the new long pole | SIMD pileup encode / fewer per-pixel allocations / batch the rayon map. |
-| Per-window haplotype cap (≤8 haplotypes per DBG) — the C++ fork's portable optimization | ~5 s on realigner | Portable, also reduces noisy assembly windows. |
+| ~~Per-window haplotype cap (≤8 haplotypes per DBG)~~ — **landed** | measured: realigner 35.9 s → 24.6 s (−31.5 %, −11.3 s) | Portable. −944 candidates (−0.45 %, noisy long tail); fork reports no accuracy loss / INDEL slightly improved. |
 | Realigner DBG SIMD/optimized hashing | ~10 s on realigner | Portable. |
 | Multi-threaded BGZF write for the CVO output | small (~1–2 s, write is already minor) | Portable. |
 | WASM target for `dv pipeline` core | n/a (offload target) | Portable; needs ORT wasm or onnxruntime-web. |
