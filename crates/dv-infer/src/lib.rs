@@ -24,6 +24,13 @@ pub trait InferenceBackend {
 
     fn input_shape(&self) -> [usize; 3];
     fn num_classes(&self) -> usize;
+
+    /// `Some(N)` if the model has a fixed batch dim of size N (callers
+    /// must submit exactly N images per `predict_batch` and pad/trim
+    /// accordingly). `None` if the batch dim is dynamic.
+    fn pinned_batch(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(feature = "tf")]

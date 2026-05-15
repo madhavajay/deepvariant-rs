@@ -67,6 +67,34 @@ enum Cmd {
         #[arg(long)]
         small_model_cvo: Option<PathBuf>,
     },
+    /// Run make-examples and call-variants concurrently in-process.
+    /// The pileup-image rendering pass streams (variant, alt_indices,
+    /// image) tuples through an internal channel into the inference
+    /// worker, eliminating the disk roundtrip and overlapping
+    /// rendering with inference.
+    Pipeline {
+        /// Input BAM file.
+        #[arg(long)]
+        reads: PathBuf,
+        /// Reference FASTA (with `.fai` index).
+        #[arg(long)]
+        ref_fasta: PathBuf,
+        /// Region literal like `chr20:10,000,000-10,010,000` (1-based inclusive).
+        #[arg(long)]
+        region: String,
+        /// Path to write the CallVariantsOutput TFRecord shard.
+        #[arg(long)]
+        output: PathBuf,
+        /// Path to the SavedModel directory or `.onnx` file.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Sample name for the output column.
+        #[arg(long, default_value = "SAMPLE")]
+        sample_name: String,
+        /// Inference batch size.
+        #[arg(long, default_value_t = 128)]
+        batch_size: usize,
+    },
     /// Stitch CallVariantsOutput shards into a VCF (and optional gVCF).
     PostprocessVariants {
         /// CallVariantsOutput TFRecord shard from the large model.
@@ -133,6 +161,23 @@ fn main() -> Result<()> {
             &sample_name,
             small_model.as_deref(),
             small_model_cvo.as_deref(),
+        ),
+        Cmd::Pipeline {
+            reads,
+            ref_fasta,
+            region,
+            output,
+            checkpoint,
+            sample_name,
+            batch_size,
+        } => pipeline_cmd(
+            &reads,
+            &ref_fasta,
+            &region,
+            &output,
+            &checkpoint,
+            &sample_name,
+            batch_size,
         ),
         Cmd::PostprocessVariants {
             cvo,
@@ -752,6 +797,588 @@ fn make_examples_cmd(
     Ok(())
 }
 
+/// Read BAM records overlapping `[shard_start, shard_end)` and run
+/// the allele counter for that sub-region. Returns
+/// `(owned, counts)`:
+///
+///   - `owned`: reads with `ref_start ∈ [shard_start, shard_end)`. A
+///     read straddling shard boundaries is emitted exactly once, by
+///     the shard whose start range contains its `ref_start`.
+///   - `counts`: per-position allele counts for `[shard_start, shard_end)`.
+///     Reads spanning shards still contribute to counts inside this
+///     shard's range — `add_read` ignores positions outside the
+///     supplied counts slice.
+fn process_shard(
+    reads_path: &std::path::Path,
+    ref_path: &std::path::Path,
+    contig: &str,
+    shard_start: i64,
+    shard_end: i64,
+) -> Result<(Vec<OwnedRead>, Vec<dv_proto::dv::AlleleCount>)> {
+    use dv_core::allelecounter::{add_read, empty_counts, AlignedRead, CounterOptions};
+    use noodles::sam::alignment::record::cigar::op::Kind as CigarKind;
+    use noodles::sam::alignment::record::QualityScores;
+    #[allow(unused_imports)]
+    use noodles::sam::alignment::Record;
+
+    fn cigar_op_to_char(op: CigarKind) -> char {
+        match op {
+            CigarKind::Match => 'M',
+            CigarKind::Insertion => 'I',
+            CigarKind::Deletion => 'D',
+            CigarKind::Skip => 'N',
+            CigarKind::SoftClip => 'S',
+            CigarKind::HardClip => 'H',
+            CigarKind::Pad => 'P',
+            CigarKind::SequenceMatch => '=',
+            CigarKind::SequenceMismatch => 'X',
+        }
+    }
+
+    let fa = dv_io::fasta::open_indexed(ref_path).context("open FASTA")?;
+    let ref_bases = fa
+        .fetch_range(contig, shard_start, shard_end)
+        .ok_or_else(|| anyhow::anyhow!("FASTA shard {contig}:{shard_start}-{shard_end} missing"))?;
+    let mut counts = empty_counts(contig, shard_start, shard_end, &ref_bases);
+    let counter_opts = CounterOptions::default();
+
+    let (h, mut reader) =
+        dv_io::reads::open(reads_path, Some(ref_path)).context("open alignment input")?;
+    let mut all_reads: Vec<OwnedRead> = Vec::new();
+    reader.for_each_record_in_region(&h, contig, shard_start, shard_end, |r| {
+        let Some(start) = r.alignment_start() else { return Ok(()) };
+        let start_0based = usize::from(start.unwrap()) as i64 - 1;
+        let flags = match r.flags() {
+            Ok(f) => f,
+            Err(_) => return Ok(()),
+        };
+        if flags.is_secondary()
+            || flags.is_supplementary()
+            || flags.is_unmapped()
+            || flags.is_duplicate()
+            || flags.is_qc_fail()
+        {
+            return Ok(());
+        }
+        let mq_check = r
+            .mapping_quality()
+            .and_then(|q| q.ok())
+            .map(|q| q.get())
+            .unwrap_or(255);
+        if mq_check < 10 {
+            return Ok(());
+        }
+        let cigar_owned: Vec<(char, i64)> = r
+            .cigar()
+            .iter()
+            .filter_map(|op| {
+                let op = op.ok()?;
+                Some((cigar_op_to_char(op.kind()), op.len() as i64))
+            })
+            .collect();
+        let read_len_on_ref: i64 = cigar_owned
+            .iter()
+            .filter(|(op, _)| matches!(op, 'M' | '=' | 'X' | 'D' | 'N'))
+            .map(|(_, l)| *l)
+            .sum();
+        if start_0based + read_len_on_ref < shard_start || start_0based >= shard_end {
+            return Ok(());
+        }
+        let seq: Vec<u8> = r.sequence().iter().map(|b| b.to_ascii_uppercase()).collect();
+        let bq: Vec<u8> = r.quality_scores().iter().map(|q| q.unwrap_or(0)).collect();
+        let mq = mq_check;
+        let is_rev = flags.is_reverse_complemented();
+        let frag = r.template_length().unwrap_or(0) as i32;
+        let name = r
+            .name()
+            .map(|n| std::str::from_utf8(n.as_ref()).unwrap_or("").to_string())
+            .unwrap_or_default();
+        let mate = if flags.is_first_segment() { 1 } else { 2 };
+        let hp_tag = {
+            use noodles::sam::alignment::record::data::field::Tag;
+            let data = r.data();
+            let raw = data
+                .get(&Tag::new(b'H', b'P'))
+                .and_then(|res| res.ok())
+                .and_then(|v| v.as_int());
+            match raw {
+                Some(1) => 1u8,
+                Some(2) => 2u8,
+                _ => 0u8,
+            }
+        };
+        all_reads.push(OwnedRead {
+            ref_start: start_0based,
+            ref_end: start_0based + read_len_on_ref,
+            cigar: cigar_owned,
+            seq,
+            bq,
+            mq,
+            is_rev,
+            frag,
+            name,
+            mate,
+            hp: hp_tag,
+        });
+        Ok(())
+    })?;
+
+    // Reads straddling boundaries still contribute to in-shard
+    // positions — `add_read` clamps writes to the counts slice.
+    for r in &all_reads {
+        let aligned = AlignedRead {
+            name: &r.name,
+            mate_number: r.mate,
+            ref_start: r.ref_start,
+            cigar: &r.cigar,
+            seq: &r.seq,
+            base_quality: &r.bq,
+            mapping_quality: r.mq,
+            is_reverse_strand: r.is_rev,
+        };
+        add_read(&mut counts, &aligned, &counter_opts, shard_start);
+    }
+
+    // Owned partition: only reads whose start is in this shard's range.
+    all_reads.retain(|r| r.ref_start >= shard_start && r.ref_start < shard_end);
+    Ok((all_reads, counts))
+}
+
+/// Run make-examples and call-variants concurrently in-process.
+///
+/// Mirrors `make_examples_cmd` up to the candidate set + pending
+/// renders, then replaces Pass 2 (collect-and-write) with a streaming
+/// pipeline:
+///
+///   - rayon par_iter renders pileup-images and pushes
+///     `(variant, alt_indices, image_u8)` onto a bounded channel.
+///   - A separate inference worker thread loads the ORT/CoreML model,
+///     drains the channel, batches, calls `predict_batch`, and writes
+///     `CallVariantsOutput` records.
+///
+/// Net effect: the disk roundtrip is gone (no intermediate
+/// `examples.tfrecord.gz`), and rendering overlaps with inference
+/// instead of running fully sequentially. On macOS+CoreML this is the
+/// equivalent of the C++ fork's `fast_pipeline` shared-memory IPC, but
+/// all in-process.
+fn pipeline_cmd(
+    reads_path: &std::path::Path,
+    ref_path: &std::path::Path,
+    region_literal: &str,
+    output_cvo_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+    sample_name: &str,
+    batch_size: usize,
+) -> Result<()> {
+    use dv_core::nucleus::ranges;
+    use dv_core::pileup_image::{
+        channels::ChannelKind,
+        layout::{render, PileupRead, VariantContext},
+        options::PileupOptions,
+    };
+    use dv_core::variant_calling::{candidates_from_counts, VariantCallerOptions};
+
+    let region = ranges::parse_literal(region_literal).map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!(
+        ?reads_path,
+        ?ref_path,
+        ?output_cvo_path,
+        ?checkpoint_path,
+        region = ?region,
+        batch_size,
+        "pipeline"
+    );
+    anyhow::ensure!(batch_size > 0, "batch_size must be > 0");
+
+    let mut stage_t = std::time::Instant::now();
+    let lap = |label: &str, t: &mut std::time::Instant| {
+        let dt = t.elapsed();
+        tracing::info!(stage = label, ms = dt.as_millis() as u64, "stage");
+        *t = std::time::Instant::now();
+    };
+
+    // ---- Region-shard pre-pass2 (BAM read + allele counter) ----
+    //
+    // Splits the input region into N=perf_cores sub-regions. Each
+    // shard does its own BAM indexed query + allele counter in
+    // parallel. Reads straddling shard boundaries contribute to
+    // counts on both sides but are emitted to `owned` exactly once
+    // (by the shard whose start range contains their `ref_start`),
+    // so the merged owned list is dedupe-free.
+    let n_shards = std::env::var("DV_SHARDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
+        .max(1);
+    let region_width = region.end - region.start;
+    let shard_width = ((region_width + n_shards as i64 - 1) / n_shards as i64).max(1);
+    let shard_ranges: Vec<(i64, i64)> = (0..n_shards as i64)
+        .map(|i| {
+            let s = region.start + i * shard_width;
+            let e = (s + shard_width).min(region.end);
+            (s, e)
+        })
+        .filter(|(s, e)| s < e)
+        .collect();
+    tracing::info!(shards = shard_ranges.len(), shard_width, "shard pre-pass2");
+
+    use rayon::prelude::*;
+    let shard_results: Result<Vec<(Vec<OwnedRead>, Vec<dv_proto::dv::AlleleCount>)>> =
+        shard_ranges
+            .par_iter()
+            .map(|&(s, e)| {
+                process_shard(reads_path, ref_path, &region.reference_name, s, e)
+            })
+            .collect();
+    let shard_outputs = shard_results?;
+    let mut owned: Vec<OwnedRead> = Vec::new();
+    let mut counts: Vec<dv_proto::dv::AlleleCount> = Vec::new();
+    for (mut shard_owned, mut shard_counts) in shard_outputs {
+        owned.append(&mut shard_owned);
+        counts.append(&mut shard_counts);
+    }
+    tracing::info!(reads_loaded = owned.len(), "loaded reads");
+    lap("shard_pre_pass2", &mut stage_t);
+
+    // Owned reads from shards are roughly sorted (each shard is in
+    // genomic order and shards run in genomic order), but
+    // intra-shard ordering is preserved from BAM order which is
+    // sorted by ref_start anyway. Final stable sort to be safe.
+    owned.sort_by_key(|r| r.ref_start);
+    let read_starts: Vec<i64> = owned.iter().map(|r| r.ref_start).collect();
+    let max_read_span: i64 = owned.iter().map(|r| r.ref_end - r.ref_start).max().unwrap_or(0);
+    lap("bam_sort", &mut stage_t);
+
+    // FASTA handle for the realigner / pass1 / pass2 fetches below.
+    // Each shard opened its own; we open a fresh one here for the
+    // remaining (single-thread) FASTA work.
+    let fa = dv_io::fasta::open_indexed(ref_path).context("open FASTA")?;
+
+    let mut cands = candidates_from_counts(&counts, &VariantCallerOptions::default());
+    tracing::info!(initial_candidates = cands.len(), "candidate variants");
+    lap("candidate_caller", &mut stage_t);
+
+    // Realigner-driven candidate expansion (mirrors make_examples_cmd).
+    {
+        use dv_core::realigner::{
+            debruijn::{DeBruijnGraph, DeBruijnOptions, ReadInput},
+            orchestrator::variants_from_haplotype,
+            window_selector::{variant_reads_candidates, windows_from_scores, WindowSelectorOptions},
+        };
+        let scores = variant_reads_candidates(&counts, &WindowSelectorOptions::default());
+        let raw_windows = windows_from_scores(&scores, 3);
+        let mut padded: Vec<(i64, i64)> = raw_windows
+            .iter()
+            .map(|(s, e)| (region.start + *s as i64 - 50, region.start + *e as i64 + 50))
+            .collect();
+        padded.sort_by_key(|w| w.0);
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for w in padded {
+            match merged.last_mut() {
+                Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                _ => merged.push(w),
+            }
+        }
+        let dbg_opts = DeBruijnOptions::default();
+        let win_refs: Vec<Option<Vec<u8>>> = merged
+            .iter()
+            .map(|(ws, we)| {
+                fa.fetch_range(&region.reference_name, *ws, *we)
+                    .filter(|b| b.len() == (we - ws) as usize)
+            })
+            .collect();
+        use rayon::prelude::*;
+        let new_cands: Vec<Variant> = merged
+            .par_iter()
+            .zip(win_refs.par_iter())
+            .filter_map(|((ws, we), win_ref_opt)| {
+                let win_ref = win_ref_opt.as_ref()?;
+                let lo = read_starts.partition_point(|&s| s + max_read_span <= *ws);
+                let hi = read_starts.partition_point(|&s| s < *we);
+                let win_reads: Vec<&OwnedRead> = owned[lo..hi]
+                    .iter()
+                    .filter(|r| r.ref_end > *ws)
+                    .collect();
+                let read_inputs: Vec<ReadInput<'_>> = win_reads
+                    .iter()
+                    .map(|r| ReadInput {
+                        aligned_sequence: &r.seq,
+                        aligned_quality: &r.bq,
+                        mapping_quality: r.mq,
+                    })
+                    .collect();
+                let graph = DeBruijnGraph::build(win_ref, &read_inputs, &dbg_opts)?;
+                let mut out: Vec<Variant> = Vec::new();
+                for hap in graph.candidate_haplotypes() {
+                    if hap.as_slice() == win_ref {
+                        continue;
+                    }
+                    for nv in
+                        variants_from_haplotype(&region.reference_name, *ws, win_ref, &hap)
+                    {
+                        out.push(nv);
+                    }
+                }
+                Some(out)
+            })
+            .flatten()
+            .collect();
+        let mut existing: std::collections::HashSet<(i64, String, Vec<String>)> =
+            std::collections::HashSet::new();
+        for v in &cands {
+            let mut alts = v.alternate_bases.clone();
+            alts.sort();
+            existing.insert((v.start, v.reference_bases.clone(), alts));
+        }
+        let mut added = 0usize;
+        for nv in new_cands {
+            let mut alts = nv.alternate_bases.clone();
+            alts.sort();
+            let key = (nv.start, nv.reference_bases.clone(), alts);
+            if existing.insert(key) {
+                cands.push(nv);
+                added += 1;
+            }
+        }
+        cands.sort_by(|a, b| {
+            (a.reference_name.as_str(), a.start, a.end).cmp(&(
+                b.reference_name.as_str(),
+                b.start,
+                b.end,
+            ))
+        });
+        tracing::info!(
+            realigner_added = added,
+            total_candidates = cands.len(),
+            assembly_windows = merged.len(),
+            "realigner candidate expansion"
+        );
+    }
+    lap("realigner", &mut stage_t);
+
+    // Build the PendingRender list (mirrors make_examples_cmd Pass 1
+    // but skips the small-model fast path — we don't expose
+    // --small-model in the pipeline subcommand for now).
+    struct PendingRender {
+        variant: Variant,
+        alt_indices: Vec<i32>,
+        img_ref: Vec<u8>,
+        win_start: i64,
+        variant_pos: i64,
+    }
+    let opts = PileupOptions::default();
+    let kinds = [
+        ChannelKind::ReadBase,
+        ChannelKind::BaseQuality,
+        ChannelKind::MappingQuality,
+        ChannelKind::Strand,
+        ChannelKind::ReadSupportsVariant,
+        ChannelKind::BaseDiffersFromRef,
+        ChannelKind::InsertSize,
+    ];
+    let width = opts.width;
+    let height = opts.height;
+    let center = (width / 2) as i64;
+    let mut pending_renders: Vec<PendingRender> = Vec::new();
+    for v in &cands {
+        let win_start = v.start - center;
+        let win_end = win_start + width as i64;
+        let img_ref = match fa.fetch_range(&v.reference_name, win_start, win_end) {
+            Some(b) if b.len() == width => b,
+            _ => continue,
+        };
+        for (i, _) in v.alternate_bases.iter().enumerate() {
+            let alt_indices = vec![i as i32];
+            pending_renders.push(PendingRender {
+                variant: v.clone(),
+                alt_indices,
+                img_ref: img_ref.clone(),
+                win_start,
+                variant_pos: v.start,
+            });
+        }
+    }
+    lap("pass1_prepare_renders", &mut stage_t);
+
+    // ---- Spawn inference worker ----
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Variant, Vec<i32>, Vec<u8>)>(256);
+    let checkpoint = checkpoint_path.to_path_buf();
+    let output = output_cvo_path.to_path_buf();
+    let bs = batch_size;
+    let cv_handle: std::thread::JoinHandle<Result<usize>> = std::thread::spawn(move || {
+        try_set_ort_dylib_path();
+        let model = load_backend(&checkpoint).context("load model")?;
+        let [h, w, c] = model.input_shape();
+        anyhow::ensure!(
+            h * w * c == PIXEL_BYTES,
+            "model input {h}x{w}x{c} != fixture pixel count {PIXEL_BYTES}"
+        );
+        let mut writer = dv_io::tfrecord::open_writer(&output).context("open CVO output")?;
+        let mut total = 0usize;
+        // If the ONNX has a fixed batch dim (e.g. 128 from
+        // `normalize_onnx_pads.py`), use that. The user-specified
+        // batch_size is overridden in that case so we always submit
+        // shape-conforming batches to CoreML / ORT — partial batches
+        // would otherwise fall back to the CPU EP and tank perf.
+        let bs = model.pinned_batch().unwrap_or(bs);
+        let mut batch_meta: Vec<(Variant, Vec<i32>)> = Vec::with_capacity(bs);
+        let mut flat_buf: Vec<f32> = Vec::with_capacity(bs * PIXEL_BYTES);
+        let flush =
+            |bm: &mut Vec<(Variant, Vec<i32>)>,
+             fb: &mut Vec<f32>,
+             writer: &mut dv_io::tfrecord::Writer<Box<dyn std::io::Write>>,
+             total: &mut usize|
+             -> Result<()> {
+                if bm.is_empty() {
+                    return Ok(());
+                }
+                let actual_n = bm.len();
+                // Pad the input buffer up to `bs` zero images if the
+                // last batch is partial. Output for the padded slots
+                // is discarded.
+                let need = bs * PIXEL_BYTES;
+                if fb.len() < need {
+                    fb.resize(need, 0.0);
+                }
+                let probs = model.predict_batch(fb, bs)?;
+                anyhow::ensure!(probs.len() == bs * 3);
+                for (i, (mut variant, alt_indices)) in bm.drain(..).enumerate() {
+                    set_model_id(&mut variant, MODEL_ID);
+                    let cvo = CallVariantsOutput {
+                        variant: Some(variant),
+                        alt_allele_indices: Some(AltAlleleIndices {
+                            indices: alt_indices,
+                        }),
+                        genotype_probabilities: probs[i * 3..(i + 1) * 3]
+                            .iter()
+                            .map(|&p| p as f64)
+                            .collect(),
+                        debug_info: None,
+                    };
+                    writer.write_record(&cvo.encode_to_vec())?;
+                    *total += 1;
+                }
+                let _ = actual_n;
+                fb.clear();
+                Ok(())
+            };
+        while let Ok((variant, alt_indices, img_u8)) = rx.recv() {
+            anyhow::ensure!(
+                img_u8.len() == PIXEL_BYTES,
+                "image bytes {} != PIXEL_BYTES {PIXEL_BYTES}",
+                img_u8.len()
+            );
+            for &b in &img_u8 {
+                flat_buf.push((b as f32 - 128.0) / 128.0);
+            }
+            batch_meta.push((variant, alt_indices));
+            if batch_meta.len() >= bs {
+                flush(&mut batch_meta, &mut flat_buf, &mut writer, &mut total)?;
+            }
+        }
+        flush(&mut batch_meta, &mut flat_buf, &mut writer, &mut total)?;
+        writer.flush()?;
+        Ok(total)
+    });
+
+    // ---- Pass 2 (parallel render → channel) ----
+    pending_renders.par_iter().for_each(|p| {
+        const READ_OVERLAP_BUFFER_BP: i64 = 5;
+        let query_start = p.variant.start - READ_OVERLAP_BUFFER_BP;
+        let query_end = p.variant.end + READ_OVERLAP_BUFFER_BP;
+        let lo = read_starts.partition_point(|&s| s + max_read_span <= query_start);
+        let hi = read_starts.partition_point(|&s| s < query_end);
+        let window_reads: Vec<&OwnedRead> = owned[lo..hi]
+            .iter()
+            .filter(|r| r.ref_end > query_start)
+            .collect();
+        let alt_set: std::collections::HashSet<u8> = p
+            .variant
+            .alternate_bases
+            .iter()
+            .filter_map(|a| a.as_bytes().first().copied())
+            .collect();
+        let supports = |r: &OwnedRead| -> bool {
+            let mut ref_pos = r.ref_start;
+            let mut read_pos = 0usize;
+            for &(op, len) in &r.cigar {
+                let len_us = len as usize;
+                match op {
+                    'M' | '=' | 'X' => {
+                        if ref_pos <= p.variant_pos && p.variant_pos < ref_pos + len {
+                            let off = (p.variant_pos - ref_pos) as usize;
+                            if read_pos + off < r.seq.len() {
+                                let b = r.seq[read_pos + off];
+                                return alt_set.contains(&b);
+                            }
+                            return false;
+                        }
+                        ref_pos += len;
+                        read_pos += len_us;
+                    }
+                    'I' | 'S' => read_pos += len_us,
+                    'D' | 'N' => ref_pos += len,
+                    _ => {}
+                }
+            }
+            false
+        };
+        let pileup_reads: Vec<PileupRead<'_>> = window_reads
+            .iter()
+            .map(|r| PileupRead {
+                ref_start: r.ref_start,
+                cigar: &r.cigar,
+                seq: &r.seq,
+                base_quality: &r.bq,
+                mapping_quality: r.mq,
+                is_reverse_strand: r.is_rev,
+                fragment_length: r.frag,
+                supports_variant: supports(r),
+                hp_tag: r.hp,
+                fragment_name: &r.name,
+                read_number: r.mate - 1,
+            })
+            .collect();
+        let ctx = Some(VariantContext {
+            variant_pos: p.variant_pos,
+            min_base_quality_at_call: 10,
+        });
+        let img = render(
+            p.win_start,
+            width,
+            height,
+            5,
+            &p.img_ref,
+            &pileup_reads,
+            &kinds,
+            &opts,
+            ctx,
+            42,
+        );
+        let mut variant_with_call = p.variant.clone();
+        if variant_with_call.calls.is_empty() {
+            variant_with_call.calls.push(Default::default());
+        }
+        variant_with_call.calls[0].call_set_name = sample_name.to_string();
+        // Channel send only fails if the receiver hung up; that means
+        // the worker died and we'll surface its error after join.
+        let _ = tx.send((variant_with_call, p.alt_indices.clone(), img));
+    });
+    drop(tx);
+    lap("pass2_render_streamed", &mut stage_t);
+
+    // ---- Wait for inference worker ----
+    let total = cv_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("inference worker panicked"))??;
+    lap("inference_drain", &mut stage_t);
+
+    tracing::info!(emitted = total, "pipeline complete");
+    Ok(())
+}
+
 /// Classify reads overlapping `variant_pos` into ref-supporting,
 /// alt-supporting (where the read base equals `alt_byte`), and report
 /// the total number of reads with coverage at this position. Walks each
@@ -1331,6 +1958,9 @@ fn call_variants(
     let mut writer = tfrecord::open_writer(output).context("open output")?;
     let mut total = 0usize;
 
+    // Pinned-batch override: if the model has a fixed N (e.g. 128
+    // from `normalize_onnx_pads.py`), use that for back-pressure.
+    let batch_size = model.pinned_batch().unwrap_or(batch_size);
     let mut batch_rows: Vec<ExampleRow> = Vec::with_capacity(batch_size);
     let mut flat_buf: Vec<f32> = Vec::with_capacity(batch_size * PIXEL_BYTES);
 
@@ -1349,11 +1979,20 @@ fn call_variants(
         if rows.is_empty() {
             return Ok(());
         }
-        let n = rows.len();
+        let actual_n = rows.len();
+        // Pad partial batches up to the fixed batch size (no-op when
+        // the model accepts dynamic batches and the row buffer
+        // happens to be full).
+        let need = batch_size * PIXEL_BYTES;
+        if buf.len() < need {
+            buf.resize(need, 0.0);
+        }
+        let n = batch_size;
         let t = std::time::Instant::now();
         let probs = model.predict_batch(buf, n)?;
         *t_predict_us += t.elapsed().as_micros() as u64;
         anyhow::ensure!(probs.len() == n * 3);
+        let _ = actual_n;
         let t = std::time::Instant::now();
         for (i, row) in rows.drain(..).enumerate() {
             let mut variant = row.variant;

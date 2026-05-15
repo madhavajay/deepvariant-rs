@@ -19,6 +19,13 @@ pub struct OrtBackend {
     input_name: String,
     output_name: String,
     input_shape: [usize; 3],
+    /// Pinned batch dim if the ONNX has a fixed N (e.g. 128 from
+    /// `normalize_onnx_pads.py`), `None` if it's dynamic. Callers
+    /// must submit exactly this many images per `predict_batch` call
+    /// when pinned — pad with zeros and trim the output. The pinning
+    /// matters for CoreML MLProgram which falls back to CPU EP on
+    /// shape mismatches.
+    pinned_batch: Option<usize>,
     num_classes: usize,
 }
 
@@ -65,18 +72,41 @@ impl OrtBackend {
             if !coreml_off {
                 use ort::ep::coreml::{ComputeUnits, ModelFormat, SpecializationStrategy};
                 use ort::ep::CoreML;
-                let ep = CoreML::default()
+                // ModelFormat: MLProgram is newer (Core ML 5+, macOS 12+),
+                // typically faster than NeuralNetwork, but it rejects any
+                // Conv missing explicit `pads`. tf2onnx leaves some Convs
+                // with default-pads-implicit, which MLProgram refuses with
+                // "Required param 'pad' is missing". `scripts/normalize_onnx_pads.py`
+                // adds the explicit `pads` and produces an MLProgram-safe
+                // model. We try MLProgram first; fall back to NeuralNetwork
+                // if the user set DV_COREML_FORMAT=NeuralNetwork.
+                let fmt = match std::env::var("DV_COREML_FORMAT").as_deref() {
+                    Ok("NeuralNetwork") | Ok("neuralnetwork") => ModelFormat::NeuralNetwork,
+                    _ => ModelFormat::MLProgram,
+                };
+                let mut ep = CoreML::default()
                     // ALL = GPU + ANE + CPU; CoreML routes per-op.
                     .with_compute_units(ComputeUnits::All)
-                    // NeuralNetwork (default) accepts our tf2onnx
-                    // export. MLProgram (newer, faster) fails to parse
-                    // the WGS Conv2D with "Required param 'pad' is
-                    // missing" — a known tf2onnx → MLProgram quirk.
-                    .with_model_format(ModelFormat::NeuralNetwork)
+                    .with_model_format(fmt)
                     // We run inference many times per session; trade
                     // a slower first compile for faster predicts.
-                    .with_specialization_strategy(SpecializationStrategy::FastPrediction)
-                    .build();
+                    .with_specialization_strategy(SpecializationStrategy::FastPrediction);
+                // Cache the compiled CoreML model so subsequent runs
+                // skip the ~20s compile. Override with DV_COREML_CACHE.
+                let cache_dir = std::env::var("DV_COREML_CACHE")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME").map(|h| {
+                            std::path::PathBuf::from(h)
+                                .join(".cache/deepvariant-rs/coreml")
+                        })
+                    });
+                if let Some(dir) = cache_dir {
+                    let _ = std::fs::create_dir_all(&dir);
+                    ep = ep.with_model_cache_dir(dir.to_string_lossy());
+                }
+                let ep = ep.build();
                 // NOTE: the WGS ONNX export keeps the batch dim dynamic
                 // (`unk__980`). We *do not* call
                 // `with_static_input_shapes(true)` — that would tell
@@ -111,11 +141,25 @@ impl OrtBackend {
         let input_shape = [100, 221, 7];
         let num_classes = 3;
 
+        // Inspect the ONNX input tensor's batch dim. If it's a fixed
+        // positive integer (e.g. 128 from `normalize_onnx_pads.py`),
+        // record it so the caller pads/trims to match. Dynamic dims
+        // are reported as -1 by ORT.
+        let pinned_batch = match input.dtype() {
+            ort::value::ValueType::Tensor { shape, .. } => {
+                let dims: &[i64] = shape.as_ref();
+                dims.first()
+                    .and_then(|d| if *d > 0 { Some(*d as usize) } else { None })
+            }
+            _ => None,
+        };
+
         Ok(Self {
             session: RefCell::new(session),
             input_name,
             output_name,
             input_shape,
+            pinned_batch,
             num_classes,
         })
     }
@@ -155,6 +199,10 @@ impl InferenceBackend for OrtBackend {
 
     fn num_classes(&self) -> usize {
         self.num_classes
+    }
+
+    fn pinned_batch(&self) -> Option<usize> {
+        self.pinned_batch
     }
 }
 

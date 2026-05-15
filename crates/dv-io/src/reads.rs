@@ -46,12 +46,14 @@ impl AlignmentFormat {
 type BamRdr = noodles::bam::io::Reader<noodles::bgzf::Reader<Box<dyn std::io::Read>>>;
 type BamIdxRdr = noodles::bam::io::IndexedReader<noodles::bgzf::Reader<std::fs::File>>;
 type CramRdr = noodles::cram::io::Reader<std::fs::File>;
+type CramIdxRdr = noodles::cram::io::IndexedReader<std::fs::File>;
 
 /// Format-dispatched alignment reader.
 pub enum AlignmentReader {
     Bam(BamRdr),
     BamIndexed(BamIdxRdr),
     Cram(CramRdr),
+    CramIndexed(CramIdxRdr),
 }
 
 /// Open an alignment file (BAM or CRAM) and return its parsed header.
@@ -91,19 +93,34 @@ pub fn open(path: &Path, ref_fasta: Option<&Path>) -> Result<(Header, AlignmentR
             }
         }
         AlignmentFormat::Cram => {
-            use noodles::fasta::{self, repository::adapters::IndexedReader};
+            use noodles::fasta::{self, repository::adapters::IndexedReader as FastaIdx};
             let ref_path = ref_fasta
                 .ok_or_else(|| anyhow!("CRAM input requires --ref-fasta to decompress sequences"))?;
             let fa_reader = fasta::indexed_reader::Builder::default()
                 .build_from_path(ref_path)
                 .with_context(|| format!("open ref FASTA {}", ref_path.display()))?;
-            let repo = fasta::Repository::new(IndexedReader::new(fa_reader));
-            let mut reader = noodles::cram::io::reader::Builder::default()
-                .set_reference_sequence_repository(repo)
-                .build_from_path(path)
-                .with_context(|| format!("open CRAM {}", path.display()))?;
-            let header = reader.read_header().context("read CRAM header")?;
-            Ok((header, AlignmentReader::Cram(reader)))
+            let repo = fasta::Repository::new(FastaIdx::new(fa_reader));
+
+            // Sibling `.crai` → indexed reader for fast region queries.
+            let crai = path.with_extension(format!(
+                "{}.crai",
+                path.extension().and_then(|e| e.to_str()).unwrap_or("cram")
+            ));
+            if crai.exists() {
+                let mut reader = noodles::cram::io::indexed_reader::Builder::default()
+                    .set_reference_sequence_repository(repo)
+                    .build_from_path(path)
+                    .with_context(|| format!("open indexed CRAM {}", path.display()))?;
+                let header = reader.read_header().context("read CRAM header")?;
+                Ok((header, AlignmentReader::CramIndexed(reader)))
+            } else {
+                let mut reader = noodles::cram::io::reader::Builder::default()
+                    .set_reference_sequence_repository(repo)
+                    .build_from_path(path)
+                    .with_context(|| format!("open CRAM {}", path.display()))?;
+                let header = reader.read_header().context("read CRAM header")?;
+                Ok((header, AlignmentReader::Cram(reader)))
+            }
         }
     }
 }
@@ -134,6 +151,13 @@ impl AlignmentReader {
                 }
             }
             AlignmentReader::Cram(r) => {
+                for rec in r.records(header) {
+                    let rec = rec.context("read CRAM record")?;
+                    f(&rec)?;
+                    n += 1;
+                }
+            }
+            AlignmentReader::CramIndexed(r) => {
                 for rec in r.records(header) {
                     let rec = rec.context("read CRAM record")?;
                     f(&rec)?;
@@ -176,6 +200,22 @@ impl AlignmentReader {
                     .with_context(|| format!("query indexed BAM {ref_name}:{start}-{end}"))?;
                 for rec in query {
                     let rec = rec.context("read BAM record")?;
+                    f(&rec)?;
+                    n += 1;
+                }
+                Ok(n)
+            }
+            AlignmentReader::CramIndexed(r) => {
+                use noodles::core::{Position, Region};
+                let s = Position::try_from(usize::try_from(start.max(0) + 1)?)?;
+                let e = Position::try_from(usize::try_from(end.max(start + 1))?)?;
+                let region = Region::new(ref_name.to_string(), s..=e);
+                let mut n = 0usize;
+                let query = r
+                    .query(header, &region)
+                    .with_context(|| format!("query indexed CRAM {ref_name}:{start}-{end}"))?;
+                for rec in query {
+                    let rec = rec.context("read CRAM record")?;
                     f(&rec)?;
                     n += 1;
                 }

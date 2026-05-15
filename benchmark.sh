@@ -95,10 +95,17 @@ if [[ ! -f "$MODEL_ONNX" ]]; then
         "$PY" -m pip install tf2onnx >/dev/null
     fi
     mkdir -p "$(dirname "$MODEL_ONNX")"
+    TMP_ONNX="$(dirname "$MODEL_ONNX")/.model.tf2onnx.onnx"
     "$PY" -m tf2onnx.convert \
         --saved-model "$SAVEDMODEL" \
-        --output "$MODEL_ONNX" \
+        --output "$TMP_ONNX" \
         --opset 17 2>&1 | tail -5
+    # Normalize Conv/MaxPool/etc. with implicit padding to explicit
+    # `pads=[0,...]` so CoreML's MLProgram parser accepts the model
+    # (it refuses `auto_pad` / implicit defaults). NeuralNetwork
+    # would have worked without this, but MLProgram is ~3× faster.
+    "$PY" "$WORKSPACE_ROOT/scripts/normalize_onnx_pads.py" "$TMP_ONNX" "$MODEL_ONNX" 2>&1 | tail -2
+    rm -f "$TMP_ONNX"
 fi
 pass "ONNX model at $MODEL_ONNX"
 

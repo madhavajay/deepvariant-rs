@@ -1,7 +1,113 @@
 # DeepVariant → Rust port — TODO
 
-What's already shipped is in `STATUS.md`. This file lists the work
-that's still outstanding, grouped by impact.
+This file lists the work that's still outstanding, grouped by impact.
+A summary of what's already landed is at the top of each section
+(checked items). Recent end-to-end performance work — methodology,
+per-stage timings, and the C++ comparison — lives in `benchmark.md`.
+
+## Performance (May 2026) — shipped this push
+
+Headline: HG003 chr20 on M2 Max, end-to-end (BAM in, CVO out):
+
+| Configuration | wall |
+|---|---|
+| Rust port — original baseline | >40 min (never finished) |
+| Rust port — `dv pipeline`, NeuralNetwork CoreML, sharded pre-pass2 | **2 m 55 s** |
+| Rust port — projected `dv pipeline` + MLProgram batch=128 pinned | est. ~1 m 30 s (not locked in on full chr20 yet) |
+| C++ Metal+CoreML+fast-pipeline fork (same machine) | 3 m 06 s |
+
+Smoke (1 Mbp slice, 2879 examples), inference only:
+
+| Backend | predict_ms |
+|---|---|
+| ORT-CPU baseline | 20,200 |
+| CoreML NeuralNetwork (dynamic batch) | 4,118 |
+| CoreML MLProgram (dynamic batch — partial-batch fallback regression) | 21,500 |
+| **CoreML MLProgram, batch=128 pinned + zero-padded last batch** | **1,275** |
+
+- [x] **Indexed BAM `.bai` query in `dv-io::reads`** — auto-detects
+  sibling `.bai`/`.csi`, exposes `for_each_record_in_region`.
+  bam_read on the chr20 1 Mbp quick bench: 14 s → 0.4 s.
+- [x] **CRAM `.crai` indexed query.** Sibling `.crai` triggers
+  `noodles::cram::IndexedReader`. Same auto-detection pattern as
+  the BAM path.
+- [x] **Sorted-read overlap index** in `dv-cli` make-examples.
+  Caches `ref_end` once at BAM-load time + binary-searches a
+  ref-start-ordered slice per query, killing the O(reads × queries)
+  inner filter in the realigner / pass2 render. Realigner on full
+  chr20: 36 min → 42 s. Pass-2 render on full chr20: would-be ~45 min
+  → 7 s.
+- [x] **Parallel-chunked gzip writer** in `dv-io::tfrecord`
+  (`write_records_gz_parallel`). Splits the record stream across
+  rayon workers; concatenated gzip streams are valid for any reader.
+  pass3_write on full chr20: 297 s → 11 s.
+- [x] **CoreML execution provider for ORT on macOS / iOS** — gated
+  `#[cfg(any(target_os = "macos", target_os = "ios"))]` in
+  `dv-infer::ort`. `MLComputeUnits::All` (GPU + ANE + CPU),
+  `SpecializationStrategy::FastPrediction`. Disable via
+  `DV_DISABLE_COREML=1` for A/B against pure ORT-CPU.
+- [x] **CoreML compiled-model cache** at
+  `~/.cache/deepvariant-rs/coreml` (override `DV_COREML_CACHE`).
+  First load pays ~20 s compile, subsequent loads skip it.
+- [x] **`dv pipeline` subcommand** — in-process ME→CV via a bounded
+  `std::sync::mpsc::sync_channel`; rayon par_iter pass-2 streams
+  `(variant, alt_indices, image_u8)` tuples into an inference worker
+  thread that loads the model and writes CVOs. The Rust analogue of
+  the C++ fork's `fast_pipeline` shared-memory bridge, all in a
+  single process. Eliminates the intermediate
+  `examples.tfrecord.gz` roundtrip and overlaps rendering with
+  inference.
+- [x] **Region-shard pre-pass2 in `dv pipeline`.** Splits the input
+  region into N=perf-cores sub-regions; each shard does its own
+  indexed BAM query + allele counter in parallel. Reads spanning
+  shard boundaries still contribute to in-shard allele counts but
+  are emitted to the merged owned list exactly once (the start-range
+  shard owns them). chr20 pre-pass2 wall: 38 s → 7 s.
+- [x] **Top-level `./benchmark.sh`** + `scripts/benchmark_rust.sh`,
+  with `--quick` (1 Mbp) and `--full` (full chr20) presets. Mirrors
+  the C++ fork's `benchmark.md` reproducibility recipe but for the
+  Rust port.
+- [x] **ONNX MLProgram normalization** (`scripts/normalize_onnx_pads.py`).
+  Adds explicit `pads=[0,...]` to Conv / MaxPool / etc. and pins the
+  batch dim so CoreML MLProgram (the newer, faster format) accepts
+  our tf2onnx export. `OrtBackend` detects the pinned dim via
+  `pinned_batch()` and the `dv pipeline` + `dv call-variants`
+  workers pad partial batches with zero images and trim the output;
+  smoke test predict 4.1 s (NeuralNetwork) → **1.3 s** (MLProgram,
+  batch=128 pinned, GPU+ANE on every batch).
+- [x] **Default to MLProgram in `dv-infer::ort`** with env-var
+  fallback `DV_COREML_FORMAT=NeuralNetwork`. `benchmark.sh` now
+  runs the normalisation script after `tf2onnx` so the produced
+  `models/wgs/model.onnx` is MLProgram-safe by default.
+
+### Outstanding — finishing the perf pass
+
+- [ ] **Lock in MLProgram + batch-pinning on full chr20.** The
+  pinned-batch + zero-pad code is live in `dv pipeline` and `dv
+  call-variants`, and the smoke bench confirms ~3× inference
+  speedup, but the full-chr20 `dv pipeline` wall hasn't been
+  re-measured since the change. Re-run with the regenerated
+  `models/wgs/model.onnx` (batch=128, explicit pads) and update
+  `benchmark.md`. Projected: pass2_render_streamed 125 s → ~50 s,
+  end-to-end chr20 ~1 m 30 s, WGS ~1 h 15 m.
+- [ ] **Run the full WGS end-to-end on this M2 Max.** Per-chromosome
+  dispatch (24 `dv pipeline` invocations, concat CVOs through `dv
+  postprocess-variants`). Blocked on the postprocess panic below.
+  Once unblocked, this is the headline reproducibility number to
+  publish.
+- [ ] **Postprocess panic on full chr20.** `add_call_to_variant`
+  panics with `assertion failed: n_alleles must be >= 2` when fed
+  the full-chr20 CVO. Reproduces from both the ME+CV pipeline and
+  `dv pipeline` outputs → pre-existing candidate / regrouping bug,
+  not introduced by the perf work. Blocks emitting a complete WGS
+  VCF.
+- [ ] **Haplotype cap (≤8 candidates per DBG)** in the realigner —
+  portable optimisation from the C++ fork, claimed −14.7 % on
+  make_examples. We already parallelised the loop, so the cap is
+  pure CPU-cycle savings.
+- [ ] **Stable benchmark snapshot per commit.** `~/deepvariant-benchmark/rust_runs_<git-sha>.json`
+  hash-keyed output so we can graph the perf journey over time and
+  spot regressions in CI.
 
 ## P0 — closes the last accuracy gap on chr20 quickstart
 
@@ -167,8 +273,13 @@ left:
     (wasm-friendly), libonnxruntime bumped to 1.24.4 (matches rc.12's
     expected ABI; older libs deadlocked Session::commit_from_file).
 
-- [ ] **iOS xcframework.** CoreML conversion of the SavedModel; new
-  `dv-infer::coreml` backend; static lib + Swift bindings.
+- [ ] **iOS xcframework.** CoreML now works on macOS through the
+  ORT CoreML execution provider (`dv-infer::ort`, `cfg(target_os =
+  "ios"/"macos")`). What's left: build `libonnxruntime` for the
+  iOS triples (`aarch64-apple-ios`, `aarch64-apple-ios-sim`),
+  package as an xcframework, ship a thin Swift wrapper around
+  `dv-cli`'s pipeline subcommand. No separate `dv-infer::coreml`
+  backend is needed — ORT's CoreML EP handles it.
 
 - [ ] **Android AAR.** TFLite conversion; new `dv-infer::tflite`
   backend; JNI bindings.
@@ -178,7 +289,10 @@ left:
 - DeepSomatic mode (somatic variant calling).
 - DeepTrio mode (parents+child joint calling).
 - Pangenome-aware mode (gbwt/gbwtgraph/sdsl/libdivsufsort).
-- `--stream_examples` Boost shared-memory pipeline.
+- ~~`--stream_examples` Boost shared-memory pipeline~~ — superseded
+  by the Rust `dv pipeline` in-process channel; if a multi-machine
+  / cross-language streaming endpoint is ever needed, gRPC over the
+  same channel format is the natural fit, not Boost SHM.
 - Training pipeline (we're inference-only).
 
 ## Stretch / nice-to-have
