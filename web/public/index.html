@@ -35,9 +35,20 @@
 </head>
 <body>
 <h1>DeepVariant-rs <small>— runs entirely in your browser · no upload · WebGPU</small></h1>
-<p>Drag a <b>BAM</b> and its matching <b>reference FASTA</b>. Everything —
-BAM parsing, make-examples, the neural net (onnxruntime-web / WebGPU),
-postprocess — runs locally in WebAssembly. Nothing is sent anywhere.</p>
+<p>Drag a <b>BAM</b> <i>and</i> its matching <b>reference FASTA</b>.
+Everything — BAM parsing, make-examples, the neural net
+(onnxruntime-web / WebGPU), postprocess — runs locally in
+WebAssembly. Nothing is sent anywhere.</p>
+<p style="background:#fff7e6;border:1px solid #f0c674;border-radius:6px;padding:.6em .8em;font-size:13px">
+<b>Why a reference FASTA?</b> A BAM contains aligned reads but
+<i>not</i> the reference genome. DeepVariant calls variants by
+comparing reads to the reference (pileup channels, candidate REF
+alleles, realigner) — so the FASTA is required (native
+<code>dv pipeline</code> always takes <code>--ref-fasta</code>
+too). It only needs to cover your <b>region</b>: a contig/region
+slice <code>.fa</code> is enough — you do <i>not</i> need the whole
+3&nbsp;GB genome. A <code>.bai</code>/<code>.crai</code> index only
+speeds up region access; it is not a substitute for the reference.</p>
 
 <div id="dropBam" class="drop">Drop the <b>.bam</b> here (or click)</div>
 <input id="fileBam" type="file" accept=".bam" hidden>
@@ -56,6 +67,19 @@ postprocess — runs locally in WebAssembly. Nothing is sent anywhere.</p>
 <div id="log">idle</div>
 <div id="done"></div>
 
+<!-- Classic script runs first: traps module-load / runtime errors
+     that would otherwise fail silently ("nothing happens"). -->
+<script>
+  window.__log = (s) => {
+    const el = document.getElementById('log');
+    el.textContent = (el.textContent === 'idle' ? '' : el.textContent) + s + '\n';
+    el.scrollTop = 1e9;
+  };
+  addEventListener('error', e =>
+    window.__log('❌ ' + (e.error && e.error.stack ? e.error.stack : e.message)));
+  addEventListener('unhandledrejection', e =>
+    window.__log('❌ promise: ' + (e.reason && e.reason.stack ? e.reason.stack : e.reason)));
+</script>
 <script type="module" src="./app.mjs"></script>
 </body>
 </html>
