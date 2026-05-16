@@ -22,5 +22,16 @@ dv-core = { path = "../dv-core", default-features = false }
 dv-proto = { path = "../dv-proto" }
 prost.workspace = true
 
+# BAM-in-browser: noodles bam/bgzf are pure Rust (flate2 →
+# miniz_oxide, NO cram so no bzip2/xz C deps). BAM is read from an
+# in-memory Cursor (no std::fs), so this builds for wasm32.
+noodles = { version = "0.92", default-features = false, features = ["bam", "sam", "bgzf", "core"] }
+
 # Optional — only needed for the browser glue layer.
 wasm-bindgen = { version = "0.2", optional = true }
+
+# Native-only: dv-io drives the parity example (write wasm-produced
+# examples to a TFRecord so native call-variants can score them).
+# Never compiled for wasm32 (examples/tests are native targets).
+[dev-dependencies]
+dv-io = { path = "../dv-io" }

@@ -8,7 +8,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+#[cfg(feature = "io")]
 use anyhow::{Context, Result};
+#[cfg(feature = "io")]
 use prost::Message;
 
 use dv_proto::dv::CallVariantsOutput;
@@ -47,6 +49,7 @@ pub mod filter {
 }
 
 /// Read CVO records from one or more TFRecord shards into a single Vec.
+#[cfg(feature = "io")]
 pub fn load_cvos<P: AsRef<std::path::Path>>(paths: &[P]) -> Result<Vec<CallVariantsOutput>> {
     let mut out = Vec::new();
     for p in paths {

@@ -38,6 +38,9 @@ use dv_proto::nucleus_v1::Variant;
 use dv_proto::tf::feature::Kind as FeatureKind;
 use dv_proto::tf::Example;
 
+/// Full BAM → examples → (JS inference) → VCF browser pipeline.
+pub mod pipeline;
+
 /// Parsed contents of a tf.Example record from a make-examples shard.
 #[derive(Debug, Clone)]
 pub struct ExampleRow {

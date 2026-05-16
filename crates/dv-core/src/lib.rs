@@ -18,7 +18,8 @@ pub mod methylation_aware_phasing;
 pub mod nucleus;
 pub mod phasing_apply;
 pub mod pileup_image;
-#[cfg(feature = "io")]
+// Pure-compute (process_cvos_into_variants etc.) is wasm-safe; only
+// `load_cvos` (TFRecord reader) is `io`-gated inside the module.
 pub mod postprocess;
 pub mod realigner;
 pub mod small_model;
