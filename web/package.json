@@ -1,0 +1,9 @@
+{
+  "name": "deepvariant-rs-web",
+  "private": true,
+  "version": "0.0.0",
+  "description": "In-browser DeepVariant-rs: drag a BAM, get a VCF. No backend.",
+  "dependencies": {
+    "onnxruntime-web": "^1.20.1"
+  }
+}

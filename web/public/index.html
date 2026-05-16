@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DeepVariant-rs — in the browser</title>
+<style>
+  body { font: 14px/1.5 system-ui, -apple-system, sans-serif; max-width: 920px;
+         margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: .1em; }
+  h1 small { color: #666; font-weight: normal; font-size: .8rem; }
+  .drop { border: 2px dashed #bbb; border-radius: 10px; padding: 1.6em 1em;
+          text-align: center; color: #666; cursor: pointer; transition: .15s;
+          margin: .6em 0; }
+  .drop.over { border-color: #2a7ade; background: #eef5fd; color: #2a7ade; }
+  .drop.has  { border-style: solid; border-color: #2a7a2a; color: #2a7a2a; }
+  .row { margin: 1em 0; display: flex; gap: .6em; align-items: center; }
+  label { font-weight: 600; }
+  input[type=text] { font: inherit; padding: .4em .5em; flex: 1;
+                     border: 1px solid #ccc; border-radius: 5px; }
+  button { font: inherit; padding: .5em 1.1em; border: 0; border-radius: 6px;
+           background: #2a7ade; color: #fff; cursor: pointer; }
+  button:disabled { background: #aaa; cursor: default; }
+  #bar { height: 12px; background: #eee; border-radius: 999px; overflow: hidden;
+         margin: 1em 0 .3em; }
+  #bar > div { height: 100%; width: 0; background: #2a7ade; transition: width .2s; }
+  #eta { font: 12px ui-monospace, Menlo, monospace; color: #555; }
+  #ep { font: 12px ui-monospace, Menlo, monospace; color: #2a7a2a; }
+  #log { font: 12px ui-monospace, Menlo, monospace; background: #1e1e1e;
+         color: #d4d4d4; padding: .8em; border-radius: 6px; height: 200px;
+         overflow: auto; white-space: pre-wrap; margin-top: 1em; }
+  a.dl { display: inline-block; margin-top: 1em; padding: .5em 1em;
+         background: #2a7a2a; color: #fff; border-radius: 6px;
+         text-decoration: none; }
+</style>
+</head>
+<body>
+<h1>DeepVariant-rs <small>— runs entirely in your browser · no upload · WebGPU</small></h1>
+<p>Drag a <b>BAM</b> and its matching <b>reference FASTA</b>. Everything —
+BAM parsing, make-examples, the neural net (onnxruntime-web / WebGPU),
+postprocess — runs locally in WebAssembly. Nothing is sent anywhere.</p>
+
+<div id="dropBam" class="drop">Drop the <b>.bam</b> here (or click)</div>
+<input id="fileBam" type="file" accept=".bam" hidden>
+<div id="dropFa" class="drop">Drop the reference <b>.fa / .fasta</b> here (or click)</div>
+<input id="fileFa" type="file" accept=".fa,.fasta,.fna" hidden>
+
+<div class="row">
+  <label for="region">Region</label>
+  <input id="region" type="text" value="chr22:20000000-20200000">
+  <button id="run" disabled>Run</button>
+</div>
+
+<div id="ep">execution provider: (detecting…)</div>
+<div id="bar"><div></div></div>
+<div id="eta">idle</div>
+<div id="log">idle</div>
+<div id="done"></div>
+
+<script type="module" src="./app.mjs"></script>
+</body>
+</html>
