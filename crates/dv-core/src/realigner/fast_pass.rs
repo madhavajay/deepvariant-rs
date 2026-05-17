@@ -12,9 +12,15 @@
 //! haplotypes are then aligned to the reference and reads are
 //! "realigned" through the haplotype→ref mapping.
 
-use crate::realigner::ssw::{align, Alignment, ScoreParams};
+use crate::realigner::ssw::{align, align_score, Alignment, ScoreParams};
 
 /// Per-read alignment to a haplotype.
+///
+/// The read→haplotype pass is **score-only** (the CIGAR/positions are
+/// never consumed downstream — only `haplotype_score` and the
+/// `Some`/`None` support flag are). `alignment` is therefore a
+/// score-only `Alignment`: `score` is exact, but `cigar` is empty and
+/// the begin/end offsets are 0. `None` still means score == 0.
 #[derive(Debug, Clone)]
 pub struct ReadAlignmentToHaplotype {
     pub read_index: usize,
@@ -64,10 +70,20 @@ pub fn align_reads_to_haplotypes(
         let mut total = 0i32;
         let mut per_read = Vec::with_capacity(reads.len());
         for (r_idx, read) in reads.iter().enumerate() {
-            let aln = align(read, hap, opts.score);
-            if let Some(a) = aln.as_ref() {
-                total += a.score;
-            }
+            let score = align_score(read, hap, opts.score);
+            let aln = if score > 0 {
+                total += score;
+                Some(Alignment {
+                    ref_begin: 0,
+                    ref_end: 0,
+                    query_begin: 0,
+                    query_end: 0,
+                    score,
+                    cigar: Vec::new(),
+                })
+            } else {
+                None
+            };
             per_read.push(ReadAlignmentToHaplotype {
                 read_index: r_idx,
                 alignment: aln,

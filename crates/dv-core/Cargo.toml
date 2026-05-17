@@ -11,6 +11,9 @@ license.workspace = true
 # can build for wasm32-unknown-unknown.
 default = ["io"]
 io = ["dep:dv-io", "dep:noodles"]
+# Opt-in experimental NEON row-max kernel for ssw::align_score. Off by
+# default: the banded scalar path is faster and bit-exact (see FAST.md).
+ssw-neon = []
 
 [dev-dependencies]
 flate2.workspace = true

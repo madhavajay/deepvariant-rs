@@ -717,7 +717,9 @@ name = "dv-wasm"
 version = "0.0.0"
 dependencies = [
  "dv-core",
+ "dv-io",
  "dv-proto",
+ "noodles",
  "prost",
  "wasm-bindgen",
 ]
